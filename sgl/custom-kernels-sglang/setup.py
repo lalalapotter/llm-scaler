@@ -1,14 +1,12 @@
 """custom-kernels-sglang — unified SYCL/ESIMD kernel package for sglang
 on Intel PTL iGPU.
 
-This commit lays down only the package scaffold (build infrastructure +
-empty extension list). Subsequent commits add:
-
-  - awq_fused_xpu (in-house SYCL kernels)
-  - custom_esimd_kernels_sglang.custom_esimd_kernels (mirrored ESIMD)
-  - custom_esimd_kernels_sglang.eagle_ops (page_attn_decode + extend)
+Built extensions:
+  - awq_fused_xpu._C   (in-house SYCL: AWQ dequant+GEMV, MoE GEMV,
+                        dense GEMV, MoE routing, RMSNorm-gated, ESIMD MoE)
 """
 import os
+from pathlib import Path
 
 # Default to PTL-only AOT codegen. The vendored build_ext.py reads
 # TORCH_XPU_ARCH_LIST and otherwise hands every architecture in
@@ -20,18 +18,49 @@ import os
 # still override.
 os.environ.setdefault("TORCH_XPU_ARCH_LIST", "ptl-h")
 
+import torch
 from setuptools import find_packages, setup
+from torch.utils.cpp_extension import SyclExtension
 
 # Use the in-tree build_ext.py — a vendored PyTorch BuildExtension with
 # fixes for SYCL/ESIMD compilation (e.g. multi-arch AOT, ESIMD doubleGRF
 # flag wiring). Identical to torch.utils.cpp_extension.BuildExtension API.
 from build_ext import BuildExtension
 
+root = Path(__file__).parent.resolve()
+torch_include = str(Path(torch.__file__).parent / "include")
+
+# ---------------------------------------------------------------------------
+# awq_fused_xpu — in-house SYCL kernels
+# ---------------------------------------------------------------------------
+awq_sources = [
+    "csrc/awq_gemv.sycl",
+    "csrc/awq_moe_gemv.sycl",
+    "csrc/awq_moe_esimd.sycl",
+    "csrc/awq_moe_esimd_npacked.sycl",
+    "csrc/dense_gemv.sycl",
+    "csrc/moe_route_topk.sycl",
+    "csrc/rmsnorm_gated.sycl",
+]
+
+awq_ext = SyclExtension(
+    name="awq_fused_xpu._C",
+    sources=awq_sources,
+    extra_compile_args={
+        "cxx": ["-O3", "-std=c++17"],
+        "sycl": ["-O3", "-fsycl", "-ffast-math",
+                 "-fsycl-device-code-split=per_kernel",
+                 f"-I{torch_include}"],
+    },
+    extra_link_args=["-Wl,-rpath,$ORIGIN/../torch/lib"],
+    py_limited_api=False,
+)
+
 setup(
     name="custom-kernels-sglang",
     version="0.1.0",
     packages=find_packages(where="python"),
     package_dir={"": "python"},
-    ext_modules=[],
+    ext_modules=[awq_ext],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

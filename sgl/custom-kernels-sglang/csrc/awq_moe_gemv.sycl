@@ -1,0 +1,932 @@
+// Batched fused AWQ dequant + GEMV for MoE decode (M=1).
+//
+// One launch processes top_k experts for the same token. Avoids
+// `index_select`-then-loop overhead (top_k separate kernel launches +
+// per-launch Python dispatch).
+//
+// Public ops in this file:
+//   awq_fused_xpu::awq_moe_gemv  — batched expert GEMV (M=1 decode)
+//   awq_fused_xpu::awq_moe_gated_gemv  — w13 (gate+up) with silu*up fused
+//   awq_fused_xpu::awq_moe_reduce_gemv  — w2 with topk-weight reduction fused
+//
+// Inputs:
+//   x        : [1, K]                   bf16/fp16
+//   qweight  : [E, K, N/8]              int32   (full weight bank)
+//   scales   : [E, K/group, N]          bf16/fp16
+//   qzeros   : [E, K/group, N/8]        int32
+//   expert_ids: [B]                     int32   (B = top_k)
+// Output:
+//   out      : [B, N]                   bf16/fp16
+//
+// Optimization (v2): group-major K-loop. Outer loop over the K/group_size
+// groups; inner loop is the (group_size / kSgSize) K iters fully unrolled
+// at compile time (8 iters for group_size=128, kSgSize=16). qz_cached /
+// sc_cached are loaded exactly once per group instead of guarded by an
+// `if (g != last_g)` branch in the inner loop. This lets the compiler
+// software-pipeline the inner unrolled body.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <sycl/sycl.hpp>
+#include <cstdint>
+
+namespace {
+
+constexpr int kSgSize = 16;
+constexpr int kOutPerSg = 8;
+constexpr int kSgPerWg = 8;
+
+// x_per_batch=false: x is shared across all batches (shape (K,)) — used for
+// w13 where every expert sees the same hidden state.
+// x_per_batch=true:  x has one row per batch (shape (B, K)) — used for w2
+// where each expert consumes its own gated activation.
+template <typename T, int kGroupSize, bool kXPerBatch>
+struct AWQMoeGemvKernelTmpl {
+  const int* qweight;       // [E, K, N/8]
+  const int* qzeros;        // [E, K/group, N/8]
+  const T* scales;          // [E, K/group, N]
+  const T* x;               // shared: [K], per-batch: [B, K]
+  const int* expert_ids;    // [B]
+  T* out;                   // [B, N]
+  int K, N;
+  long long qw_stride_e;
+  long long qz_stride_e;
+  long long sc_stride_e;
+  long long x_stride_b;     // 0 if shared, K if per-batch
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    constexpr int kIterPerGroup = kGroupSize / kSgSize;  // 8 for 128/16
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int b = item.get_global_id(0);  // expert index in batch
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (packed_n * kOutPerSg >= N) return;
+
+    const int e = expert_ids[b];
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / 8;
+    const int num_groups = K / kGroupSize;
+
+    const int* qw_e = qweight + e * qw_stride_e;
+    const int* qz_e = qzeros + e * qz_stride_e;
+    const T*   sc_e = scales + e * sc_stride_e;
+    const T*   x_b = kXPerBatch ? (x + b * x_stride_b) : x;
+
+    float acc[kOutPerSg] = {0.f};
+
+    for (int g = 0; g < num_groups; ++g) {
+      const int qz_cached = qz_e[g * packed_stride + packed_n];
+      float sc_cached[kOutPerSg];
+      float ofs_cached[kOutPerSg];  // = -z_int * sc_cached
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        sc_cached[o] = static_cast<float>(sc_e[g * N + n_base + o]);
+        ofs_cached[o] = -z_int * sc_cached[o];
+      }
+
+      const int k_group_base = g * kGroupSize;
+      const int k0 = k_group_base + sg_local_id;
+      #pragma unroll
+      for (int it = 0; it < kIterPerGroup; ++it) {
+        const int k = k0 + it * kSgSize;
+        const int qw = qw_e[k * packed_stride + packed_n];
+        const float xv = static_cast<float>(x_b[k]);
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          const int shift = 4 * orders[o];
+          const float w_int = static_cast<float>((qw >> shift) & 0xF);
+          // (w_int - z_int) * sc = w_int * sc + ofs.  Two FMAs per nibble.
+          acc[o] += xv * (w_int * sc_cached[o] + ofs_cached[o]);
+        }
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      out[b * N + n_base + sg_local_id] = static_cast<T>(acc[sg_local_id]);
+    }
+  }
+};
+
+template <typename T, bool kXPerBatch>
+struct AWQMoeGemvKernel {
+  const int* qweight;
+  const int* qzeros;
+  const T* scales;
+  const T* x;
+  const int* expert_ids;
+  T* out;
+  int K, N, group_size;
+  long long qw_stride_e;
+  long long qz_stride_e;
+  long long sc_stride_e;
+  long long x_stride_b;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int b = item.get_global_id(0);
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (packed_n * kOutPerSg >= N) return;
+
+    const int e = expert_ids[b];
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / 8;
+
+    const int* qw_e = qweight + e * qw_stride_e;
+    const int* qz_e = qzeros + e * qz_stride_e;
+    const T*   sc_e = scales + e * sc_stride_e;
+    const T*   x_b = kXPerBatch ? (x + b * x_stride_b) : x;
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    int qz_cached = 0;
+    float sc_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) sc_cached[o] = 0.f;
+
+    for (int k = sg_local_id; k < K; k += kSgSize) {
+      const int g = k / group_size;
+      if (g != last_g) {
+        qz_cached = qz_e[g * packed_stride + packed_n];
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = static_cast<float>(sc_e[g * N + n_base + o]);
+        }
+        last_g = g;
+      }
+      const int qw = qw_e[k * packed_stride + packed_n];
+      const float xv = static_cast<float>(x_b[k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_int) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      out[b * N + n_base + sg_local_id] = static_cast<T>(acc[sg_local_id]);
+    }
+  }
+};
+
+template <typename T, bool kXPerBatch>
+void launch_awq_moe_gemv(
+    sycl::queue& q,
+    const int* qweight, const int* qzeros, const T* scales,
+    const T* x, const int* expert_ids, T* out,
+    int B, int K, int N, int group_size,
+    long long qw_stride_e, long long qz_stride_e, long long sc_stride_e,
+    long long x_stride_b) {
+  const int wg_n = kSgSize * kSgPerWg;
+  const int packed_n_count = N / kOutPerSg;
+  const int packed_groups = (packed_n_count + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(static_cast<size_t>(B),
+                        static_cast<size_t>(packed_groups) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  if (group_size == 128 && (K % 128) == 0) {
+    AWQMoeGemvKernelTmpl<T, 128, kXPerBatch> kfn{
+        qweight, qzeros, scales, x, expert_ids, out,
+        K, N, qw_stride_e, qz_stride_e, sc_stride_e, x_stride_b};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else {
+    AWQMoeGemvKernel<T, kXPerBatch> kfn{
+        qweight, qzeros, scales, x, expert_ids, out,
+        K, N, group_size, qw_stride_e, qz_stride_e, sc_stride_e, x_stride_b};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  }
+}
+
+}  // namespace
+
+namespace {
+
+// =============================================================================
+// Gated variant: fuses gate-up split + silu + mul into the GEMV output.
+// qweight stores [gate_proj | up_proj] concatenated along N. Each sub-group
+// here computes one packed_n output column of the gated activation by reading
+// BOTH the gate column (at packed_n) and the up column (at packed_n + N/8)
+// in the same K iteration, then writing silu(gate) * up directly.
+//   N here = moe_inter (final gated output width), qweight has 2*N/8 cols.
+// =============================================================================
+template <typename T, int kGroupSize>
+struct AWQMoeGatedGemvKernelTmpl {
+  const int* qweight;       // [E, K, 2*N/8]
+  const int* qzeros;        // [E, K/group, 2*N/8]
+  const T* scales;          // [E, K/group, 2*N]
+  const T* x;               // [K]
+  const int* expert_ids;    // [B]
+  T* out;                   // [B, N]
+  int K, N;                 // N = moe_inter (gated width)
+  long long qw_stride_e;
+  long long qz_stride_e;
+  long long sc_stride_e;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    constexpr int kIterPerGroup = kGroupSize / kSgSize;
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int b = item.get_global_id(0);
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n_gate = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (packed_n_gate * kOutPerSg >= N) return;
+
+    const int e = expert_ids[b];
+    const int n_base_gate = packed_n_gate * kOutPerSg;
+    const int n_base_up = N + n_base_gate;
+    const int packed_stride_qw = 2 * (N / kOutPerSg);  // total qweight cols
+    const int packed_n_up = packed_n_gate + (N / kOutPerSg);
+    const int num_groups = K / kGroupSize;
+    const int scales_cols = 2 * N;
+
+    const int* qw_e = qweight + e * qw_stride_e;
+    const int* qz_e = qzeros + e * qz_stride_e;
+    const T*   sc_e = scales + e * sc_stride_e;
+
+    float gate_acc[kOutPerSg] = {0.f};
+    float up_acc[kOutPerSg] = {0.f};
+
+    for (int g = 0; g < num_groups; ++g) {
+      const int gate_qz_cached = qz_e[g * packed_stride_qw + packed_n_gate];
+      const int up_qz_cached   = qz_e[g * packed_stride_qw + packed_n_up];
+      float gate_sc[kOutPerSg];
+      float up_sc[kOutPerSg];
+      float gate_ofs[kOutPerSg];
+      float up_ofs[kOutPerSg];
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float gz = static_cast<float>((gate_qz_cached >> shift) & 0xF);
+        const float uz = static_cast<float>((up_qz_cached >> shift) & 0xF);
+        gate_sc[o] = static_cast<float>(sc_e[g * scales_cols + n_base_gate + o]);
+        up_sc[o]   = static_cast<float>(sc_e[g * scales_cols + n_base_up + o]);
+        gate_ofs[o] = -gz * gate_sc[o];
+        up_ofs[o]   = -uz * up_sc[o];
+      }
+
+      const int k_group_base = g * kGroupSize;
+      const int k0 = k_group_base + sg_local_id;
+      #pragma unroll
+      for (int it = 0; it < kIterPerGroup; ++it) {
+        const int k = k0 + it * kSgSize;
+        const int gate_qw = qw_e[k * packed_stride_qw + packed_n_gate];
+        const int up_qw   = qw_e[k * packed_stride_qw + packed_n_up];
+        const float xv = static_cast<float>(x[k]);
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          const int shift = 4 * orders[o];
+          const float gw_int = static_cast<float>((gate_qw >> shift) & 0xF);
+          const float uw_int = static_cast<float>((up_qw >> shift) & 0xF);
+          gate_acc[o] += xv * (gw_int * gate_sc[o] + gate_ofs[o]);
+          up_acc[o]   += xv * (uw_int * up_sc[o]   + up_ofs[o]);
+        }
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      gate_acc[o] = sycl::reduce_over_group(sg, gate_acc[o], sycl::plus<float>());
+      up_acc[o]   = sycl::reduce_over_group(sg, up_acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      const float gv = gate_acc[sg_local_id];
+      const float uv = up_acc[sg_local_id];
+      // silu(g) * u  = g * sigmoid(g) * u
+      const float silu_g = gv / (1.0f + sycl::exp(-gv));
+      out[b * N + n_base_gate + sg_local_id] =
+          static_cast<T>(silu_g * uv);
+    }
+  }
+};
+
+template <typename T>
+struct AWQMoeGatedGemvKernel {
+  const int* qweight;
+  const int* qzeros;
+  const T* scales;
+  const T* x;
+  const int* expert_ids;
+  T* out;
+  int K, N, group_size;
+  long long qw_stride_e;
+  long long qz_stride_e;
+  long long sc_stride_e;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int b = item.get_global_id(0);
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n_gate = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (packed_n_gate * kOutPerSg >= N) return;
+
+    const int e = expert_ids[b];
+    const int n_base_gate = packed_n_gate * kOutPerSg;
+    const int n_base_up = N + n_base_gate;
+    const int packed_stride_qw = 2 * (N / kOutPerSg);
+    const int packed_n_up = packed_n_gate + (N / kOutPerSg);
+
+    const int* qw_e = qweight + e * qw_stride_e;
+    const int* qz_e = qzeros + e * qz_stride_e;
+    const T*   sc_e = scales + e * sc_stride_e;
+
+    float gate_acc[kOutPerSg] = {0.f};
+    float up_acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    int gate_qz_cached = 0, up_qz_cached = 0;
+    float gate_sc[kOutPerSg];
+    float up_sc[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) { gate_sc[o] = 0.f; up_sc[o] = 0.f; }
+
+    const int scales_cols = 2 * N;
+
+    for (int k = sg_local_id; k < K; k += kSgSize) {
+      const int g = k / group_size;
+      if (g != last_g) {
+        gate_qz_cached = qz_e[g * packed_stride_qw + packed_n_gate];
+        up_qz_cached   = qz_e[g * packed_stride_qw + packed_n_up];
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          gate_sc[o] = static_cast<float>(sc_e[g * scales_cols + n_base_gate + o]);
+          up_sc[o]   = static_cast<float>(sc_e[g * scales_cols + n_base_up + o]);
+        }
+        last_g = g;
+      }
+      const int gate_qw = qw_e[k * packed_stride_qw + packed_n_gate];
+      const int up_qw   = qw_e[k * packed_stride_qw + packed_n_up];
+      const float xv = static_cast<float>(x[k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float gw = static_cast<float>((gate_qw >> shift) & 0xF)
+                       - static_cast<float>((gate_qz_cached >> shift) & 0xF);
+        const float uw = static_cast<float>((up_qw >> shift) & 0xF)
+                       - static_cast<float>((up_qz_cached >> shift) & 0xF);
+        gate_acc[o] += xv * gw * gate_sc[o];
+        up_acc[o]   += xv * uw * up_sc[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      gate_acc[o] = sycl::reduce_over_group(sg, gate_acc[o], sycl::plus<float>());
+      up_acc[o]   = sycl::reduce_over_group(sg, up_acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      const float gv = gate_acc[sg_local_id];
+      const float uv = up_acc[sg_local_id];
+      const float silu_g = gv / (1.0f + sycl::exp(-gv));
+      out[b * N + n_base_gate + sg_local_id] = static_cast<T>(silu_g * uv);
+    }
+  }
+};
+
+template <typename T>
+void launch_awq_moe_gated_gemv(
+    sycl::queue& q,
+    const int* qweight, const int* qzeros, const T* scales,
+    const T* x, const int* expert_ids, T* out,
+    int B, int K, int N, int group_size,
+    long long qw_stride_e, long long qz_stride_e, long long sc_stride_e) {
+  const int wg_n = kSgSize * kSgPerWg;
+  const int packed_n_count = N / kOutPerSg;
+  const int packed_groups = (packed_n_count + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(static_cast<size_t>(B),
+                        static_cast<size_t>(packed_groups) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  if (group_size == 128 && (K % 128) == 0) {
+    AWQMoeGatedGemvKernelTmpl<T, 128> kfn{
+        qweight, qzeros, scales, x, expert_ids, out,
+        K, N, qw_stride_e, qz_stride_e, sc_stride_e};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else {
+    AWQMoeGatedGemvKernel<T> kfn{
+        qweight, qzeros, scales, x, expert_ids, out,
+        K, N, group_size, qw_stride_e, qz_stride_e, sc_stride_e};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  }
+}
+
+// =============================================================================
+// Reduce variant for w2 (down_proj): fuses (ws[b] * out_b).sum(b) into the
+// GEMV. Grid is (B, packed_groups) like awq_moe_gemv to keep parallelism;
+// each sub-group computes one (b, packed_n) GEMV partial and atomically
+// adds (topk_weights[b] * partial) into the (hidden,) output. The atomic
+// adds on PTL are fast at this granularity (8 floats per sub-group, totaling
+// B × N atomic ops per layer = 8 × 2048 = 16k atomics, all to local-cached
+// fp32 accumulator).
+// =============================================================================
+// 2-D grid (B, packed_groups). Each sub-group computes one (b, packed_n)
+// GEMV partial, multiplies by topk_weights[b], and atomic-adds 8 floats
+// into a global fp32 accumulator. A second tiny kernel finalises the
+// fp32 accumulator into the bf16/fp16 output. Atomic contention is light
+// because each (n_base + lane) cell receives exactly B writes total.
+template <typename T, int kGroupSize>
+struct AWQMoeReduceGemvKernelTmpl {
+  const int* qweight;
+  const int* qzeros;
+  const T* scales;
+  const T* x;
+  const int* expert_ids;
+  const T* topk_weights;
+  float* acc_out;            // [N]   fp32 accumulator
+  int B, K, N;
+  long long qw_stride_e;
+  long long qz_stride_e;
+  long long sc_stride_e;
+  long long x_stride_b;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    constexpr int kIterPerGroup = kGroupSize / kSgSize;
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int b = item.get_global_id(0);
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (packed_n * kOutPerSg >= N) return;
+
+    const int e = expert_ids[b];
+    const float w_b = static_cast<float>(topk_weights[b]);
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / kOutPerSg;
+    const int num_groups = K / kGroupSize;
+
+    const int* qw_e = qweight + e * qw_stride_e;
+    const int* qz_e = qzeros + e * qz_stride_e;
+    const T*   sc_e = scales + e * sc_stride_e;
+    const T*   x_b  = x + b * x_stride_b;
+
+    float acc[kOutPerSg] = {0.f};
+
+    for (int g = 0; g < num_groups; ++g) {
+      const int qz_cached = qz_e[g * packed_stride + packed_n];
+      float sc_cached[kOutPerSg];
+      float ofs_cached[kOutPerSg];
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        sc_cached[o] = static_cast<float>(sc_e[g * N + n_base + o]);
+        ofs_cached[o] = -z_int * sc_cached[o];
+      }
+
+      const int k_group_base = g * kGroupSize;
+      const int k0 = k_group_base + sg_local_id;
+      #pragma unroll
+      for (int it = 0; it < kIterPerGroup; ++it) {
+        const int k = k0 + it * kSgSize;
+        const int qw = qw_e[k * packed_stride + packed_n];
+        const float xv = static_cast<float>(x_b[k]);
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          const int shift = 4 * orders[o];
+          const float w_int = static_cast<float>((qw >> shift) & 0xF);
+          acc[o] += xv * (w_int * sc_cached[o] + ofs_cached[o]);
+        }
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      const float v = w_b * acc[sg_local_id];
+      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                       sycl::memory_scope::device,
+                       sycl::access::address_space::global_space>
+          ar(acc_out[n_base + sg_local_id]);
+      ar.fetch_add(v);
+    }
+  }
+};
+
+template <typename T>
+struct AWQMoeReduceGemvKernel {
+  const int* qweight;
+  const int* qzeros;
+  const T* scales;
+  const T* x;
+  const int* expert_ids;
+  const T* topk_weights;
+  float* acc_out;
+  int B, K, N, group_size;
+  long long qw_stride_e;
+  long long qz_stride_e;
+  long long sc_stride_e;
+  long long x_stride_b;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int b = item.get_global_id(0);
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (packed_n * kOutPerSg >= N) return;
+
+    const int e = expert_ids[b];
+    const float w_b = static_cast<float>(topk_weights[b]);
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / kOutPerSg;
+
+    const int* qw_e = qweight + e * qw_stride_e;
+    const int* qz_e = qzeros + e * qz_stride_e;
+    const T*   sc_e = scales + e * sc_stride_e;
+    const T*   x_b  = x + b * x_stride_b;
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    int qz_cached = 0;
+    float sc_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) sc_cached[o] = 0.f;
+
+    for (int k = sg_local_id; k < K; k += kSgSize) {
+      const int g = k / group_size;
+      if (g != last_g) {
+        qz_cached = qz_e[g * packed_stride + packed_n];
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = static_cast<float>(sc_e[g * N + n_base + o]);
+        }
+        last_g = g;
+      }
+      const int qw = qw_e[k * packed_stride + packed_n];
+      const float xv = static_cast<float>(x_b[k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_int) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      const float v = w_b * acc[sg_local_id];
+      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                       sycl::memory_scope::device,
+                       sycl::access::address_space::global_space>
+          ar(acc_out[n_base + sg_local_id]);
+      ar.fetch_add(v);
+    }
+  }
+};
+
+template <typename T>
+struct CastFp32ToTOut {
+  const float* acc_in;
+  T* out;
+  int N;
+  void operator()(sycl::id<1> idx) const {
+    int i = idx[0];
+    if (i < N) out[i] = static_cast<T>(acc_in[i]);
+  }
+};
+
+template <typename T>
+void launch_awq_moe_reduce_gemv(
+    sycl::queue& q,
+    const int* qweight, const int* qzeros, const T* scales,
+    const T* x, const int* expert_ids, const T* topk_weights, T* out,
+    int B, int K, int N, int group_size,
+    long long qw_stride_e, long long qz_stride_e, long long sc_stride_e,
+    long long x_stride_b, float* acc_buf) {
+  // Zero the fp32 accumulator.
+  q.memset(acc_buf, 0, static_cast<size_t>(N) * sizeof(float));
+
+  const int wg_n = kSgSize * kSgPerWg;
+  const int packed_n_count = N / kOutPerSg;
+  const int packed_groups = (packed_n_count + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(static_cast<size_t>(B),
+                        static_cast<size_t>(packed_groups) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  if (group_size == 128 && (K % 128) == 0) {
+    AWQMoeReduceGemvKernelTmpl<T, 128> kfn{
+        qweight, qzeros, scales, x, expert_ids, topk_weights, acc_buf,
+        B, K, N, qw_stride_e, qz_stride_e, sc_stride_e, x_stride_b};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else {
+    AWQMoeReduceGemvKernel<T> kfn{
+        qweight, qzeros, scales, x, expert_ids, topk_weights, acc_buf,
+        B, K, N, group_size, qw_stride_e, qz_stride_e, sc_stride_e, x_stride_b};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  }
+
+  // Cast accumulator back to T.
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(static_cast<size_t>(N)),
+                     CastFp32ToTOut<T>{acc_buf, out, N});
+  });
+}
+
+}  // namespace
+
+at::Tensor awq_moe_gated_gemv(
+    at::Tensor x,
+    at::Tensor qweight,
+    at::Tensor scales,
+    at::Tensor qzeros,
+    at::Tensor expert_ids) {
+  TORCH_CHECK(qweight.dim() == 3 && scales.dim() == 3 && qzeros.dim() == 3);
+  TORCH_CHECK(x.is_xpu() && qweight.is_xpu() && scales.is_xpu()
+              && qzeros.is_xpu() && expert_ids.is_xpu());
+  TORCH_CHECK(qweight.scalar_type() == at::kInt
+              && qzeros.scalar_type() == at::kInt
+              && expert_ids.scalar_type() == at::kInt);
+  TORCH_CHECK(x.dim() == 1 || (x.dim() == 2 && x.size(0) == 1),
+              "awq_moe_gated_gemv: x must be (K,) or (1, K) (shared input)");
+
+  const int E = static_cast<int>(qweight.size(0));
+  const int K = static_cast<int>(qweight.size(1));
+  const int packed_2N = static_cast<int>(qweight.size(2));
+  TORCH_CHECK(packed_2N % 2 == 0, "qweight cols must be even (gate+up)");
+  const int N = (packed_2N / 2) * 8;  // gated output width
+  const int group_size = K / static_cast<int>(scales.size(1));
+  const int B = static_cast<int>(expert_ids.numel());
+  (void)E;
+
+  TORCH_CHECK(scales.size(2) == 2 * N, "scales col mismatch (must be 2*N)");
+  TORCH_CHECK(qzeros.size(2) == packed_2N, "qzeros col mismatch");
+  TORCH_CHECK(scales.scalar_type() == x.scalar_type());
+
+  auto out = at::empty({B, N}, x.options());
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  const int* qweight_ptr = reinterpret_cast<const int*>(qweight.data_ptr<int>());
+  const int* qzeros_ptr = reinterpret_cast<const int*>(qzeros.data_ptr<int>());
+  const int* eid_ptr = reinterpret_cast<const int*>(expert_ids.data_ptr<int>());
+
+  const long long qw_stride_e = static_cast<long long>(qweight.stride(0));
+  const long long qz_stride_e = static_cast<long long>(qzeros.stride(0));
+  const long long sc_stride_e = static_cast<long long>(scales.stride(0));
+
+  if (scales.scalar_type() == at::kHalf) {
+    auto sc_p = reinterpret_cast<const sycl::half*>(scales.data_ptr<at::Half>());
+    auto x_p  = reinterpret_cast<const sycl::half*>(x.data_ptr<at::Half>());
+    auto out_p= reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
+    launch_awq_moe_gated_gemv<sycl::half>(
+        q, qweight_ptr, qzeros_ptr, sc_p, x_p, eid_ptr, out_p,
+        B, K, N, group_size, qw_stride_e, qz_stride_e, sc_stride_e);
+  } else if (scales.scalar_type() == at::kBFloat16) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    auto sc_p = reinterpret_cast<const bf16*>(scales.data_ptr<at::BFloat16>());
+    auto x_p  = reinterpret_cast<const bf16*>(x.data_ptr<at::BFloat16>());
+    auto out_p= reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    launch_awq_moe_gated_gemv<bf16>(
+        q, qweight_ptr, qzeros_ptr, sc_p, x_p, eid_ptr, out_p,
+        B, K, N, group_size, qw_stride_e, qz_stride_e, sc_stride_e);
+  } else {
+    TORCH_CHECK(false, "Unsupported scales dtype: ", scales.scalar_type());
+  }
+  return out;
+}
+
+at::Tensor awq_moe_reduce_gemv(
+    at::Tensor x,                // (B, K)
+    at::Tensor qweight,          // (E, K, N/8)
+    at::Tensor scales,
+    at::Tensor qzeros,
+    at::Tensor expert_ids,       // (B,)
+    at::Tensor topk_weights) {   // (B,)
+  TORCH_CHECK(qweight.dim() == 3 && scales.dim() == 3 && qzeros.dim() == 3);
+  TORCH_CHECK(x.is_xpu() && qweight.is_xpu() && scales.is_xpu()
+              && qzeros.is_xpu() && expert_ids.is_xpu()
+              && topk_weights.is_xpu());
+  TORCH_CHECK(qweight.scalar_type() == at::kInt
+              && qzeros.scalar_type() == at::kInt
+              && expert_ids.scalar_type() == at::kInt);
+  TORCH_CHECK(x.dim() == 2, "awq_moe_reduce_gemv: x must be (B, K)");
+  TORCH_CHECK(topk_weights.scalar_type() == x.scalar_type(),
+              "topk_weights dtype must match x");
+
+  const int E = static_cast<int>(qweight.size(0));
+  const int K = static_cast<int>(qweight.size(1));
+  const int packed_N = static_cast<int>(qweight.size(2));
+  const int N = packed_N * 8;
+  const int group_size = K / static_cast<int>(scales.size(1));
+  const int B = static_cast<int>(expert_ids.numel());
+  (void)E;
+
+  TORCH_CHECK(x.size(0) == B && x.size(1) == K, "x shape must be (B, K)");
+  TORCH_CHECK(topk_weights.numel() == B, "topk_weights size must equal B");
+  TORCH_CHECK(scales.size(2) == N && qzeros.size(2) == packed_N);
+  TORCH_CHECK(scales.scalar_type() == x.scalar_type());
+
+  auto out = at::empty({N}, x.options());
+  auto acc = at::empty({N}, x.options().dtype(at::kFloat));
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  const int* qweight_ptr = reinterpret_cast<const int*>(qweight.data_ptr<int>());
+  const int* qzeros_ptr = reinterpret_cast<const int*>(qzeros.data_ptr<int>());
+  const int* eid_ptr = reinterpret_cast<const int*>(expert_ids.data_ptr<int>());
+  float* acc_ptr = acc.data_ptr<float>();
+
+  const long long qw_stride_e = static_cast<long long>(qweight.stride(0));
+  const long long qz_stride_e = static_cast<long long>(qzeros.stride(0));
+  const long long sc_stride_e = static_cast<long long>(scales.stride(0));
+  const long long x_stride_b  = static_cast<long long>(x.stride(0));
+
+  if (scales.scalar_type() == at::kHalf) {
+    auto sc_p = reinterpret_cast<const sycl::half*>(scales.data_ptr<at::Half>());
+    auto x_p  = reinterpret_cast<const sycl::half*>(x.data_ptr<at::Half>());
+    auto tw_p = reinterpret_cast<const sycl::half*>(topk_weights.data_ptr<at::Half>());
+    auto out_p= reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
+    launch_awq_moe_reduce_gemv<sycl::half>(
+        q, qweight_ptr, qzeros_ptr, sc_p, x_p, eid_ptr, tw_p, out_p,
+        B, K, N, group_size, qw_stride_e, qz_stride_e, sc_stride_e, x_stride_b,
+        acc_ptr);
+  } else if (scales.scalar_type() == at::kBFloat16) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    auto sc_p = reinterpret_cast<const bf16*>(scales.data_ptr<at::BFloat16>());
+    auto x_p  = reinterpret_cast<const bf16*>(x.data_ptr<at::BFloat16>());
+    auto tw_p = reinterpret_cast<const bf16*>(topk_weights.data_ptr<at::BFloat16>());
+    auto out_p= reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    launch_awq_moe_reduce_gemv<bf16>(
+        q, qweight_ptr, qzeros_ptr, sc_p, x_p, eid_ptr, tw_p, out_p,
+        B, K, N, group_size, qw_stride_e, qz_stride_e, sc_stride_e, x_stride_b,
+        acc_ptr);
+  } else {
+    TORCH_CHECK(false, "Unsupported scales dtype: ", scales.scalar_type());
+  }
+  return out;
+}
+
+at::Tensor awq_moe_gemv(
+    at::Tensor x,
+    at::Tensor qweight,
+    at::Tensor scales,
+    at::Tensor qzeros,
+    at::Tensor expert_ids) {
+  TORCH_CHECK(qweight.dim() == 3 && scales.dim() == 3 && qzeros.dim() == 3,
+              "expert weight tensors must be 3-D (E, ...)");
+  TORCH_CHECK(x.is_xpu() && qweight.is_xpu() && scales.is_xpu()
+              && qzeros.is_xpu() && expert_ids.is_xpu());
+  TORCH_CHECK(qweight.scalar_type() == at::kInt
+              && qzeros.scalar_type() == at::kInt
+              && expert_ids.scalar_type() == at::kInt,
+              "qweight/qzeros/expert_ids must be int32");
+
+  const int E = static_cast<int>(qweight.size(0));
+  const int K = static_cast<int>(qweight.size(1));
+  const int packed_N = static_cast<int>(qweight.size(2));
+  const int N = packed_N * 8;
+  const int group_size = K / static_cast<int>(scales.size(1));
+  const int B = static_cast<int>(expert_ids.numel());
+
+  TORCH_CHECK(scales.size(0) == E && qzeros.size(0) == E,
+              "expert dim mismatch");
+  TORCH_CHECK(scales.size(2) == N, "scales col mismatch");
+  TORCH_CHECK(qzeros.size(2) == packed_N, "qzeros col mismatch");
+  TORCH_CHECK(scales.scalar_type() == x.scalar_type(),
+              "x dtype must match scales dtype");
+  (void)E;
+
+  // Two valid x shapes:
+  //   shared:    1-D (K,) or 2-D (1, K)  → all batches see the same input
+  //   per-batch: 2-D (B, K)              → each batch sees its own row
+  bool x_per_batch = false;
+  long long x_stride_b = 0;
+  if (x.dim() == 1) {
+    TORCH_CHECK(x.size(0) == K, "x (1-D) must have size K");
+  } else if (x.dim() == 2) {
+    if (x.size(0) == 1) {
+      TORCH_CHECK(x.size(1) == K, "x (1, K) must have second dim K");
+    } else {
+      TORCH_CHECK(x.size(0) == B && x.size(1) == K,
+                  "x (B, K) must match batch and K");
+      x_per_batch = true;
+      x_stride_b = static_cast<long long>(x.stride(0));
+    }
+  } else {
+    TORCH_CHECK(false, "x must be 1-D or 2-D");
+  }
+
+  auto out = at::empty({B, N}, x.options());
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  const int* qweight_ptr = reinterpret_cast<const int*>(qweight.data_ptr<int>());
+  const int* qzeros_ptr = reinterpret_cast<const int*>(qzeros.data_ptr<int>());
+  const int* eid_ptr = reinterpret_cast<const int*>(expert_ids.data_ptr<int>());
+
+  const long long qw_stride_e = static_cast<long long>(qweight.stride(0));
+  const long long qz_stride_e = static_cast<long long>(qzeros.stride(0));
+  const long long sc_stride_e = static_cast<long long>(scales.stride(0));
+
+  if (scales.scalar_type() == at::kHalf) {
+    auto sc_p = reinterpret_cast<const sycl::half*>(scales.data_ptr<at::Half>());
+    auto x_p = reinterpret_cast<const sycl::half*>(x.data_ptr<at::Half>());
+    auto out_p = reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
+    if (x_per_batch) {
+      launch_awq_moe_gemv<sycl::half, true>(
+          q, qweight_ptr, qzeros_ptr, sc_p, x_p, eid_ptr, out_p,
+          B, K, N, group_size,
+          qw_stride_e, qz_stride_e, sc_stride_e, x_stride_b);
+    } else {
+      launch_awq_moe_gemv<sycl::half, false>(
+          q, qweight_ptr, qzeros_ptr, sc_p, x_p, eid_ptr, out_p,
+          B, K, N, group_size,
+          qw_stride_e, qz_stride_e, sc_stride_e, 0);
+    }
+  } else if (scales.scalar_type() == at::kBFloat16) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    auto sc_p = reinterpret_cast<const bf16*>(scales.data_ptr<at::BFloat16>());
+    auto x_p = reinterpret_cast<const bf16*>(x.data_ptr<at::BFloat16>());
+    auto out_p = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    if (x_per_batch) {
+      launch_awq_moe_gemv<bf16, true>(
+          q, qweight_ptr, qzeros_ptr, sc_p, x_p, eid_ptr, out_p,
+          B, K, N, group_size,
+          qw_stride_e, qz_stride_e, sc_stride_e, x_stride_b);
+    } else {
+      launch_awq_moe_gemv<bf16, false>(
+          q, qweight_ptr, qzeros_ptr, sc_p, x_p, eid_ptr, out_p,
+          B, K, N, group_size,
+          qw_stride_e, qz_stride_e, sc_stride_e, 0);
+    }
+  } else {
+    TORCH_CHECK(false, "Unsupported scales dtype: ", scales.scalar_type());
+  }
+  return out;
+}
+
+TORCH_LIBRARY_FRAGMENT(awq_fused_xpu, m) {
+  m.def("awq_moe_gemv(Tensor x, Tensor qweight, Tensor scales, Tensor qzeros, Tensor expert_ids) -> Tensor");
+  m.def("awq_moe_gated_gemv(Tensor x, Tensor qweight, Tensor scales, Tensor qzeros, Tensor expert_ids) -> Tensor");
+  m.def("awq_moe_reduce_gemv(Tensor x, Tensor qweight, Tensor scales, Tensor qzeros, Tensor expert_ids, Tensor topk_weights) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(awq_fused_xpu, XPU, m) {
+  m.impl("awq_moe_gemv", &awq_moe_gemv);
+  m.impl("awq_moe_gated_gemv", &awq_moe_gated_gemv);
+  m.impl("awq_moe_reduce_gemv", &awq_moe_reduce_gemv);
+}

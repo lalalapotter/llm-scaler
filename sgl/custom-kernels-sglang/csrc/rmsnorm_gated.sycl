@@ -1,0 +1,132 @@
+// Fused RMSNorm + gated SiLU for GDN (gated delta net) post-attn norm.
+//
+// Computes (matches sglang/srt/layers/attention/fla/layernorm_gated.py
+//           with is_rms_norm=True, norm_before_gate=True, activation='swish',
+//           bias=None, group_size=None):
+//
+//   for each row m:
+//     var = mean(x[m,:]^2)
+//     y   = x[m,:] * rsqrt(var + eps) * weight[:]
+//     out = y * silu(z[m,:])     # silu(z) = z / (1 + exp(-z))
+//
+// One sub-group (16 lanes) processes one row. N is small (=128 in
+// Qwen3.5-2B GDN), so 16 lanes and a sub-group reduce are sufficient.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <sycl/sycl.hpp>
+#include <cstdint>
+
+namespace {
+
+constexpr int kSgSize = 16;
+constexpr int kSgPerWg = 8;
+
+template <typename T>
+struct RmsNormGatedKernel {
+  const T* x;        // [M, N]
+  const T* z;        // [M, N]
+  const T* weight;   // [N]
+  T*       out;      // [M, N]
+  int M, N;
+  float eps;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    auto sg = item.get_sub_group();
+    const int lane = sg.get_local_id()[0];
+
+    const int wg_id = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int m = wg_id * kSgPerWg + sg_id_in_wg;
+    if (m >= M) return;
+
+    const T* xrow = x + m * N;
+    const T* zrow = z + m * N;
+    T*       orow = out + m * N;
+
+    // 1) sum of squares
+    float sumsq = 0.f;
+    for (int i = lane; i < N; i += kSgSize) {
+      const float xv = static_cast<float>(xrow[i]);
+      sumsq += xv * xv;
+    }
+    sumsq = sycl::reduce_over_group(sg, sumsq, sycl::plus<float>());
+    const float rstd = sycl::native::rsqrt(sumsq / N + eps);
+
+    // 2) normalize × weight × silu(z)
+    for (int i = lane; i < N; i += kSgSize) {
+      const float xv = static_cast<float>(xrow[i]);
+      const float zv = static_cast<float>(zrow[i]);
+      const float wv = static_cast<float>(weight[i]);
+      const float silu = zv / (1.f + sycl::native::exp(-zv));
+      const float y = xv * rstd * wv * silu;
+      orow[i] = static_cast<T>(y);
+    }
+  }
+};
+
+}  // namespace
+
+at::Tensor rmsnorm_gated(const at::Tensor& x_in, const at::Tensor& z_in,
+                         const at::Tensor& weight, double eps) {
+  TORCH_CHECK(x_in.is_xpu() && z_in.is_xpu() && weight.is_xpu(),
+              "rmsnorm_gated: tensors must be on XPU");
+  TORCH_CHECK(x_in.dim() >= 2, "rmsnorm_gated: x must be at least 2D");
+  TORCH_CHECK(x_in.sizes() == z_in.sizes(), "rmsnorm_gated: x/z shape mismatch");
+  TORCH_CHECK(x_in.scalar_type() == z_in.scalar_type(),
+              "rmsnorm_gated: x/z dtype mismatch");
+
+  // Reshape to [M, N]. Weight may live in fp32 (model init dtype) while
+  // activations are bf16; cast it once on the host side.
+  auto x = x_in.contiguous();
+  auto z = z_in.contiguous();
+  auto w = (weight.scalar_type() == x.scalar_type())
+               ? weight.contiguous()
+               : weight.to(x.scalar_type()).contiguous();
+  const int N = x.size(-1);
+  const int M = x.numel() / N;
+  TORCH_CHECK(w.numel() == N, "rmsnorm_gated: weight size != N");
+  TORCH_CHECK(N <= 4096, "rmsnorm_gated: N too large for 16-lane reduce");
+
+  auto out = at::empty_like(x);
+
+  auto xpu_stream = c10::xpu::getCurrentXPUStream();
+  sycl::queue& q = xpu_stream.queue();
+
+  const int wg_n = kSgSize * kSgPerWg;
+  const int wg_count = (M + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(1, static_cast<size_t>(wg_count) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  if (x.scalar_type() == at::kBFloat16) {
+    using T = c10::BFloat16;
+    RmsNormGatedKernel<T> kfn{x.data_ptr<T>(), z.data_ptr<T>(),
+                              w.data_ptr<T>(), out.data_ptr<T>(),
+                              M, N, static_cast<float>(eps)};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else if (x.scalar_type() == at::kHalf) {
+    using T = c10::Half;
+    RmsNormGatedKernel<T> kfn{x.data_ptr<T>(), z.data_ptr<T>(),
+                              w.data_ptr<T>(), out.data_ptr<T>(),
+                              M, N, static_cast<float>(eps)};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else {
+    TORCH_CHECK(false, "rmsnorm_gated: unsupported dtype ", x.scalar_type());
+  }
+  return out;
+}
+
+TORCH_LIBRARY_FRAGMENT(awq_fused_xpu, m) {
+  m.def("rmsnorm_gated(Tensor x, Tensor z, Tensor weight, float eps) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(awq_fused_xpu, XPU, m) {
+  m.impl("rmsnorm_gated", &rmsnorm_gated);
+}

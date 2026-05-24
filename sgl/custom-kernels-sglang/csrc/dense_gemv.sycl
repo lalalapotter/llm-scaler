@@ -1,0 +1,392 @@
+// Dense bf16/fp16 GEMV for batch=1 decode.
+//
+// Used for the un-quantized linears in Qwen3.5-AWQ (linear_attn / self_attn
+// projections that the AWQ checkpoint marks as `modules_to_not_convert`).
+//
+// Layout (matches PyTorch nn.Linear):
+//   x   : [M, K]   T   row-major
+//   W   : [N, K]   T   row-major   (weight = [out_features, in_features])
+//   out : [M, N]   T   row-major
+//
+// Compute:  out[m, n] = sum_k x[m, k] * W[n, k]
+//
+// V1: one sub-group computes one output n; 16 lanes stride along K and
+// reduce. W access is fully coalesced because W[n, k] is contiguous in k.
+//
+// K-split: when N is small (e.g. in_proj_ba with N=32), one sub-group per
+// output cannot saturate the EUs. We assign multiple sub-groups to the same
+// n and accumulate into an fp32 scratch via atomic_ref<float>, then cast
+// scratch → bf16 at the end.
+//
+// Shape specialization: for production shapes used in Qwen3.5-35B-A3B-AWQ
+// decode (8 fixed shapes from the modules_to_not_convert list) we template
+// on (K, N, kKSplit). Compile-time bounds let the compiler fully unroll
+// the K-strided inner loop and skip ksplit dispatch at runtime. Generic
+// fallback handles any other shape.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <sycl/sycl.hpp>
+#include <cstdint>
+
+namespace {
+
+constexpr int kSgSize = 16;
+constexpr int kSgPerWg = 8;
+
+template <typename T>
+struct CastFp32ToTDense {
+  const float* in_fp32;
+  T* out;
+  int total;
+  void operator()(sycl::id<1> idx) const {
+    int i = idx[0];
+    if (i < total) out[i] = static_cast<T>(in_fp32[i]);
+  }
+};
+
+// ─── runtime-shape fallback ──────────────────────────────────────────────
+
+template <typename T>
+struct DenseGemvV1 {
+  const T* x;     // [M, K]
+  const T* W;     // [N, K]
+  T*       out;   // [M, N]
+  int M, K, N;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (m >= M || n >= N) return;
+
+    const T* xrow = x + m * K;
+    const T* wrow = W + n * K;
+
+    float acc = 0.f;
+    for (int k = sg_local_id; k < K; k += kSgSize) {
+      const float xv = static_cast<float>(xrow[k]);
+      const float wv = static_cast<float>(wrow[k]);
+      acc += xv * wv;
+    }
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+
+    if (sg_local_id == 0) {
+      out[m * N + n] = static_cast<T>(acc);
+    }
+  }
+};
+
+template <typename T, int kKSplit>
+struct DenseGemvKSplit {
+  const T*    x;          // [M, K]
+  const T*    W;           // [N, K]
+  float*      out_fp32;   // [M, N]   (zero-initialised)
+  int M, K, N;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int linear_id = wg_id_n * kSgPerWg + sg_id_in_wg;
+    const int n = linear_id / kKSplit;
+    const int ksplit_id = linear_id % kKSplit;
+    if (m >= M || n >= N) return;
+
+    const int K_per_split = (K + kKSplit - 1) / kKSplit;
+    const int k_start = ksplit_id * K_per_split;
+    const int k_end = sycl::min(k_start + K_per_split, K);
+
+    const T* xrow = x + m * K;
+    const T* wrow = W + n * K;
+
+    float acc = 0.f;
+    for (int k = k_start + sg_local_id; k < k_end; k += kSgSize) {
+      const float xv = static_cast<float>(xrow[k]);
+      const float wv = static_cast<float>(wrow[k]);
+      acc += xv * wv;
+    }
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+
+    if (sg_local_id == 0) {
+      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                        sycl::memory_scope::device,
+                        sycl::access::address_space::global_space>
+        out_a(out_fp32[m * N + n]);
+      out_a.fetch_add(acc);
+    }
+  }
+};
+
+// ─── shape-specialized fast paths ────────────────────────────────────────
+// M is always 1 for batch=1 decode. K, N, kKSplit are compile-time
+// constants → the compiler can fully unroll the strided K-loop and remove
+// every ksplit dispatch at runtime. Two variants:
+//   - kKSplit == 1: writes T directly to `out`, no atomics, no scratch.
+//   - kKSplit  > 1: atomic-adds fp32 partials into scratch, second kernel
+//                   casts scratch → T.
+
+template <typename T, int K_, int N_>
+struct DenseGemvV1Spec {
+  const T* x;        // [1, K_]
+  const T* W;        // [N_, K_]
+  T*       out;      // [1, N_]
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (n >= N_) return;
+
+    const T* wrow = W + n * K_;
+
+    float acc = 0.f;
+    #pragma unroll 4
+    for (int k = sg_local_id; k < K_; k += kSgSize) {
+      const float xv = static_cast<float>(x[k]);
+      const float wv = static_cast<float>(wrow[k]);
+      acc += xv * wv;
+    }
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+
+    if (sg_local_id == 0) {
+      out[n] = static_cast<T>(acc);
+    }
+  }
+};
+
+template <typename T, int K_, int N_, int kKSplit_>
+struct DenseGemvKSplitSpec {
+  const T* x;            // [1, K_]
+  const T* W;            // [N_, K_]
+  float*   out_fp32;     // [1, N_]   (pre-zeroed)
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int linear_id = wg_id_n * kSgPerWg + sg_id_in_wg;
+    constexpr int kKSplit = kKSplit_;
+    const int n = linear_id / kKSplit;
+    const int ksplit_id = linear_id % kKSplit;
+    if (n >= N_) return;
+
+    constexpr int K_per_split = (K_ + kKSplit - 1) / kKSplit;
+    const int k_start = ksplit_id * K_per_split;
+    const int k_end = (ksplit_id + 1) * K_per_split > K_
+                          ? K_ : (ksplit_id + 1) * K_per_split;
+
+    const T* wrow = W + n * K_;
+
+    float acc = 0.f;
+    #pragma unroll 4
+    for (int k = k_start + sg_local_id; k < k_end; k += kSgSize) {
+      const float xv = static_cast<float>(x[k]);
+      const float wv = static_cast<float>(wrow[k]);
+      acc += xv * wv;
+    }
+    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+
+    if (sg_local_id == 0) {
+      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                       sycl::memory_scope::device,
+                       sycl::access::address_space::global_space>
+          out_a(out_fp32[n]);
+      out_a.fetch_add(acc);
+    }
+  }
+};
+
+template <typename T, int K_, int N_, int kKSplit_>
+void launch_dense_gemv_spec(sycl::queue& q, const T* x, const T* W, T* out,
+                             at::Tensor& workspace_fp32_out) {
+  constexpr int wg_n = kSgSize * kSgPerWg;
+  constexpr int total_sg = N_ * kKSplit_;
+  constexpr int wg_count = (total_sg + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(1, static_cast<size_t>(wg_count) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  if constexpr (kKSplit_ == 1) {
+    DenseGemvV1Spec<T, K_, N_> kfn{x, W, out};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else {
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kXPU);
+    workspace_fp32_out = at::zeros({1, N_}, opts);
+    float* scratch = workspace_fp32_out.data_ptr<float>();
+
+    DenseGemvKSplitSpec<T, K_, N_, kKSplit_> kfn{x, W, scratch};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+
+    constexpr int total = N_;
+    constexpr int wg = 256;
+    constexpr int gx = ((total + wg - 1) / wg) * wg;
+    CastFp32ToTDense<T> ck{scratch, out, total};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::range<1>(gx), ck);
+    });
+  }
+}
+
+// ─── runtime-shape generic launch (fallback) ─────────────────────────────
+
+template <typename T>
+void launch_dense_gemv_generic(
+    sycl::queue& q,
+    const T* x, const T* W, T* out,
+    int M, int K, int N, at::Tensor& workspace_fp32_out) {
+  // Heuristic: pick K-split factor based on N (and K).
+  int ksplit = 1;
+  if (N <= 32 && K >= 1024)        ksplit = 8;
+  else if (N <= 128 && K >= 1024)  ksplit = 4;
+  else if (N <= 512 && K >= 2048)  ksplit = 2;
+  else if (N <= 1024 && K >= 4096) ksplit = 2;
+
+  const int wg_n = kSgSize * kSgPerWg;
+  const int total_sg_per_m = N * ksplit;
+  const int wg_count = (total_sg_per_m + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(static_cast<size_t>(M),
+                        static_cast<size_t>(wg_count) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  if (ksplit == 1) {
+    DenseGemvV1<T> kfn{x, W, out, M, K, N};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else {
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kXPU);
+    workspace_fp32_out = at::zeros({M, N}, opts);
+    float* scratch = workspace_fp32_out.data_ptr<float>();
+
+    auto submit = [&](auto kfn) {
+      q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+      });
+    };
+    if (ksplit == 2) submit(DenseGemvKSplit<T, 2>{x, W, scratch, M, K, N});
+    else if (ksplit == 4) submit(DenseGemvKSplit<T, 4>{x, W, scratch, M, K, N});
+    else                  submit(DenseGemvKSplit<T, 8>{x, W, scratch, M, K, N});
+
+    const int total = M * N;
+    const int wg = 256;
+    const int gx = ((total + wg - 1) / wg) * wg;
+    CastFp32ToTDense<T> ck{scratch, out, total};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::range<1>(gx), ck);
+    });
+  }
+}
+
+// ─── shape-specialized dispatch ──────────────────────────────────────────
+// Production shapes used at decode in Qwen3.5-35B-A3B-AWQ (modules_to_not_convert):
+//   (calls/step, K, N)              ksplit  comment
+//        40   ( 4096,  2048)            1   linear_attn / self_attn out_proj
+//        40   ( 2048,  1024)            1   misc small in_proj
+//        30   ( 2048, 12288)            1   linear_attn 6× in_proj  ← top-1 GPU
+//        40   (  512,  2048)            1   shared_expert w2
+//        40   ( 2048,   256)            2   MoE router gate
+//        40   ( 2048,     1)            8   shared_expert gate
+//        30   ( 2048,    64)            4   linear_attn dt_proj
+//        10   ( 2048,  9216)            1   self_attn QKV fused
+template <typename T>
+bool launch_dense_gemv_specialized(
+    sycl::queue& q, const T* x, const T* W, T* out,
+    int M, int K, int N, at::Tensor& scratch) {
+  if (M != 1) return false;
+
+  #define DISPATCH(K_, N_, KSPLIT_)                              \
+    if (K == (K_) && N == (N_)) {                                \
+      launch_dense_gemv_spec<T, K_, N_, KSPLIT_>(q, x, W, out, scratch); \
+      return true;                                               \
+    }
+
+  DISPATCH(2048, 12288, 1)   // linear_attn 6× in_proj  (top-1)
+  DISPATCH(2048, 9216,  1)   // self_attn QKV fused
+  DISPATCH(4096, 2048,  1)   // out_proj
+  DISPATCH(2048, 1024,  1)
+  DISPATCH(512,  2048,  1)   // shared_expert w2
+  DISPATCH(2048, 256,   2)   // MoE router gate
+  DISPATCH(2048, 64,    4)   // dt_proj
+  DISPATCH(2048, 1,     8)   // shared_expert gate
+
+  #undef DISPATCH
+  return false;
+}
+
+template <typename T>
+void launch_dense_gemv(
+    sycl::queue& q,
+    const T* x, const T* W, T* out,
+    int M, int K, int N, at::Tensor& workspace_fp32_out) {
+  if (launch_dense_gemv_specialized<T>(q, x, W, out, M, K, N, workspace_fp32_out)) {
+    return;
+  }
+  launch_dense_gemv_generic<T>(q, x, W, out, M, K, N, workspace_fp32_out);
+}
+
+}  // namespace
+
+at::Tensor dense_gemv(const at::Tensor& x, const at::Tensor& W) {
+  TORCH_CHECK(x.is_xpu() && W.is_xpu(), "dense_gemv: tensors must be on XPU");
+  TORCH_CHECK(x.is_contiguous() && W.is_contiguous(), "dense_gemv: contiguous required");
+  TORCH_CHECK(x.dim() == 2 && W.dim() == 2, "dense_gemv: x[M,K] W[N,K] expected");
+  TORCH_CHECK(x.size(1) == W.size(1), "dense_gemv: K mismatch");
+  TORCH_CHECK(x.scalar_type() == W.scalar_type(), "dense_gemv: dtype mismatch");
+
+  const int M = x.size(0);
+  const int K = x.size(1);
+  const int N = W.size(0);
+
+  auto opts = x.options();
+  auto out = at::empty({M, N}, opts);
+
+  auto xpu_stream = c10::xpu::getCurrentXPUStream();
+  sycl::queue& q = xpu_stream.queue();
+
+  at::Tensor scratch;  // optional, kept alive until after submit
+
+  if (x.scalar_type() == at::kBFloat16) {
+    using T = c10::BFloat16;
+    launch_dense_gemv<T>(q,
+        x.data_ptr<T>(), W.data_ptr<T>(), out.data_ptr<T>(),
+        M, K, N, scratch);
+  } else if (x.scalar_type() == at::kHalf) {
+    using T = c10::Half;
+    launch_dense_gemv<T>(q,
+        x.data_ptr<T>(), W.data_ptr<T>(), out.data_ptr<T>(),
+        M, K, N, scratch);
+  } else {
+    TORCH_CHECK(false, "dense_gemv: unsupported dtype ", x.scalar_type());
+  }
+  return out;
+}
+
+TORCH_LIBRARY_FRAGMENT(awq_fused_xpu, m) {
+  m.def("dense_gemv(Tensor x, Tensor W) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(awq_fused_xpu, XPU, m) {
+  m.impl("dense_gemv", &dense_gemv);
+}

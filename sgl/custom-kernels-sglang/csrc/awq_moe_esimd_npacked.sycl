@@ -1,0 +1,423 @@
+// ESIMD AWQ MoE kernels reading the AWQ on-disk N-packed layout directly.
+//
+// Key trick: AWQ stores 8 nibbles per int32 along the N axis (one int32 covers
+// 8 adjacent N cols at the SAME K row). So one block_load<int32, 16> gives us
+// 16 packed × 8 = 128 N-cols of weight data for a single K. Combined with
+// vLLM's GS=16 SLM-split scheme, we get a thread-per-K-slice kernel that
+// avoids any host-side repack of the AWQ tensor.
+//
+// AWQ layout (unchanged on-disk):
+//   qweight : [E, K,   N/8]   int32   pack_order = [0,4,1,5,2,6,3,7]
+//   qzeros  : [E, K/G, N/8]   int32   same pack
+//   scales  : [E, K/G, N]     bf16/fp16
+//
+// Public ops:
+//   awq_moe_gated_np_esimd   — w13 (gate+up) GEMV + silu(gate)*up fused
+//   awq_moe_reduce_np_esimd  — w2 GEMV + topk-weighted reduce fused
+
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/intel/esimd.hpp>
+#include <ATen/Parallel.h>
+#include <cstdint>
+
+namespace {
+using fp16 = sycl::half;
+using bf16 = sycl::ext::oneapi::bfloat16;
+using namespace sycl::ext::intel::esimd;
+
+// AWQ pack order: nibble for output N+o lives at bits[4*pack_order[o] : +4].
+// We hard-code this in the kernel instead of looking up a constant table.
+constexpr int kAwqPackOrder[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gated kernel (w13): SLM K-split, GS=16. WG = (1, GS) threads.
+// Each WG covers a tile of kPacks_per_tile=16 packed_n cols (= 128 N-cols
+// gate + 128 N-cols up). Each thread handles K/GS rows.
+// Range = (B, num_n_tiles * GS), local = (1, GS).
+//
+//   x        [K]                    bf16/fp16
+//   qweight  [E, K, 2*N/8]          int32   (gate concat up along N)
+//   qzeros   [E, K/G, 2*N/8]        int32
+//   scales   [E, K/G, 2*N]          bf16/fp16
+//   ids      [B]                    int32
+// Output:
+//   out      [B, N]                 bf16/fp16  (= silu(gate) * up)
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename IT, int GS, int kGroupSize>
+void launch_awq_moe_gated_np_esimd(
+    sycl::queue& q,
+    const IT* x,
+    const int32_t* qweight,
+    const int32_t* qzeros,
+    const IT* scales,
+    const int* expert_ids,
+    IT* out,
+    int B, int K, int N) {
+  constexpr int kPacksPerTile = 8;        // 8 packed_int32 = 64 N-cols (smaller for register pressure)
+  constexpr int kColsPerTile = kPacksPerTile * 8;  // 128
+  const int packed_stride = 2 * (N / 8);   // gate+up packed cols total
+  const int K_groups = K / kGroupSize;
+  const int two_N = 2 * N;
+  const int num_n_tiles = N / kColsPerTile;
+
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(B, static_cast<size_t>(num_n_tiles) * GS),
+            sycl::range<2>(1, GS)),
+        [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+          // SLM: GS threads × 2 (gate+up) × 128 floats.
+          slm_init<GS * 2 * kColsPerTile * sizeof(float)>();
+
+          const int b        = (int)item.get_global_id(0);
+          const int tile_idx = (int)item.get_group(1);
+          const int tid      = (int)item.get_local_id(1);
+
+          const int n_col_start = tile_idx * kColsPerTile;
+          const int packed_n_gate = tile_idx * kPacksPerTile;
+          const int packed_n_up   = packed_n_gate + (N / 8);
+
+          const int eid = expert_ids[b];
+          const int32_t* qw_e = qweight + (size_t)eid * K * packed_stride;
+          const int32_t* qz_e = qzeros  + (size_t)eid * K_groups * packed_stride;
+          const IT*      sc_e = scales  + (size_t)eid * K_groups * two_N;
+
+          // Per-thread per-col accumulator: 128 N-cols × 1 (gate or up).
+          simd<float, kColsPerTile> gate_acc(0.f);
+          simd<float, kColsPerTile> up_acc(0.f);
+
+          // Each thread covers a K-slice of K/GS rows, in stride-GS interleaving.
+          // Group boundary handling: cache scales/offsets per group.
+          int last_g = -1;
+          simd<float, kColsPerTile> g_scale_v(0.f);
+          simd<float, kColsPerTile> u_scale_v(0.f);
+          simd<float, kColsPerTile> g_offset_v(0.f);
+          simd<float, kColsPerTile> u_offset_v(0.f);
+
+          for (int k = tid; k < K; k += GS) {
+            int g = k / kGroupSize;
+            if (g != last_g) {
+              // Load 16 packed qzeros (= 128 N-nibbles) for this group.
+              simd<int32_t, kPacksPerTile> g_qz = block_load<int32_t, kPacksPerTile>(
+                  qz_e + (size_t)g * packed_stride + packed_n_gate);
+              simd<int32_t, kPacksPerTile> u_qz = block_load<int32_t, kPacksPerTile>(
+                  qz_e + (size_t)g * packed_stride + packed_n_up);
+              // Load 128 fp16/bf16 scales (already in N-major form).
+              simd<IT, kColsPerTile> g_scale_raw = block_load<IT, kColsPerTile>(
+                  sc_e + (size_t)g * two_N + n_col_start);
+              simd<IT, kColsPerTile> u_scale_raw = block_load<IT, kColsPerTile>(
+                  sc_e + (size_t)g * two_N + N + n_col_start);
+              g_scale_v = convert<float>(g_scale_raw);
+              u_scale_v = convert<float>(u_scale_raw);
+
+              // Unpack qzeros into 128-wide nibble vec, then offset = -qz * scale.
+              simd<float, kColsPerTile> g_qz_f, u_qz_f;
+              #pragma unroll
+              for (int o = 0; o < 8; o++) {
+                int shift = 4 * kAwqPackOrder[o];
+                simd<int32_t, kPacksPerTile> gz_nib = (g_qz >> shift) & 0xF;
+                simd<int32_t, kPacksPerTile> uz_nib = (u_qz >> shift) & 0xF;
+                // Strided write: o-th nibble of each int32 lands at index o, o+8, o+16,...
+                g_qz_f.template select<kPacksPerTile, 8>(o) = convert<float>(gz_nib);
+                u_qz_f.template select<kPacksPerTile, 8>(o) = convert<float>(uz_nib);
+              }
+              g_offset_v = -g_qz_f * g_scale_v;
+              u_offset_v = -u_qz_f * u_scale_v;
+              last_g = g;
+            }
+
+            // Load 16 packed_int32 = 128 N-nibbles for this K row.
+            simd<int32_t, kPacksPerTile> g_qw = block_load<int32_t, kPacksPerTile>(
+                qw_e + (size_t)k * packed_stride + packed_n_gate);
+            simd<int32_t, kPacksPerTile> u_qw = block_load<int32_t, kPacksPerTile>(
+                qw_e + (size_t)k * packed_stride + packed_n_up);
+
+            // Unpack 8 N-nibbles per int32 → 128 nibbles each (gate/up).
+            simd<float, kColsPerTile> g_nib_f, u_nib_f;
+            #pragma unroll
+            for (int o = 0; o < 8; o++) {
+              int shift = 4 * kAwqPackOrder[o];
+              simd<int32_t, kPacksPerTile> gn = (g_qw >> shift) & 0xF;
+              simd<int32_t, kPacksPerTile> un = (u_qw >> shift) & 0xF;
+              g_nib_f.template select<kPacksPerTile, 8>(o) = convert<float>(gn);
+              u_nib_f.template select<kPacksPerTile, 8>(o) = convert<float>(un);
+            }
+
+            // (nibble - qz) * scale  ==  nibble * scale + offset
+            simd<float, kColsPerTile> g_dq = g_nib_f * g_scale_v + g_offset_v;
+            simd<float, kColsPerTile> u_dq = u_nib_f * u_scale_v + u_offset_v;
+
+            float xv = (float)(IT)x[k];
+            gate_acc += g_dq * xv;
+            up_acc   += u_dq * xv;
+          }
+
+          // SLM reduce: each thread writes its 256 floats (128 gate + 128 up).
+          uint32_t slm_off = (uint32_t)(tid * 2 * kColsPerTile) * 4u;
+          slm_block_store<float, kColsPerTile>(slm_off, gate_acc);
+          slm_block_store<float, kColsPerTile>(slm_off + kColsPerTile * 4u, up_acc);
+          barrier();
+
+          if (tid == 0) {
+            simd<float, kColsPerTile> g_sum(0.f), u_sum(0.f);
+            #pragma unroll
+            for (int i = 0; i < GS; i++) {
+              uint32_t off = (uint32_t)(i * 2 * kColsPerTile) * 4u;
+              g_sum += slm_block_load<float, kColsPerTile>(off);
+              u_sum += slm_block_load<float, kColsPerTile>(off + kColsPerTile * 4u);
+            }
+            simd<float, kColsPerTile> silu =
+                g_sum / (1.f + sycl::ext::intel::esimd::exp(-g_sum));
+            simd<float, kColsPerTile> result = silu * u_sum;
+            block_store<IT, kColsPerTile>(
+                out + (size_t)b * N + n_col_start, convert<IT>(result));
+          }
+        });
+  });
+}
+
+at::Tensor awq_moe_gated_np_esimd(
+    at::Tensor x,
+    at::Tensor qweight,
+    at::Tensor scales,
+    at::Tensor qzeros,
+    at::Tensor expert_ids) {
+  TORCH_CHECK(x.is_xpu() && qweight.is_xpu() && scales.is_xpu() &&
+              qzeros.is_xpu() && expert_ids.is_xpu());
+  TORCH_CHECK(qweight.scalar_type() == at::kInt);
+  TORCH_CHECK(qzeros.scalar_type() == at::kInt);
+  TORCH_CHECK(expert_ids.scalar_type() == at::kInt);
+  TORCH_CHECK(qweight.dim() == 3 && scales.dim() == 3 && qzeros.dim() == 3);
+  TORCH_CHECK(scales.scalar_type() == x.scalar_type());
+
+  const int E = static_cast<int>(qweight.size(0));
+  const int K = static_cast<int>(qweight.size(1));
+  const int packed_2N = static_cast<int>(qweight.size(2));
+  const int N = (packed_2N / 2) * 8;
+  const int K_groups = static_cast<int>(scales.size(1));
+  const int group_size = K / K_groups;
+  const int B = static_cast<int>(expert_ids.numel());
+  (void)E;
+
+  TORCH_CHECK(packed_2N % 2 == 0);
+  TORCH_CHECK(N % 128 == 0, "N (moe_inter) must be multiple of 128");
+  TORCH_CHECK(K % 16 == 0, "K must be multiple of GS=16");
+  TORCH_CHECK(group_size == 128, "only group_size=128 supported");
+  if (x.dim() == 1) {
+    TORCH_CHECK(x.size(0) == K);
+  } else {
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1 && x.size(1) == K);
+  }
+
+  auto out = at::empty({B, N}, x.options());
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  const int32_t* qw_p  = qweight.data_ptr<int32_t>();
+  const int32_t* qz_p  = qzeros.data_ptr<int32_t>();
+  const int*     eid_p = expert_ids.data_ptr<int>();
+
+  if (x.scalar_type() == at::kHalf) {
+    const fp16* x_p   = reinterpret_cast<const fp16*>(x.data_ptr<at::Half>());
+    const fp16* sc_p  = reinterpret_cast<const fp16*>(scales.data_ptr<at::Half>());
+    fp16*       out_p = reinterpret_cast<fp16*>(out.data_ptr<at::Half>());
+    launch_awq_moe_gated_np_esimd<fp16, 16, 128>(
+        q, x_p, qw_p, qz_p, sc_p, eid_p, out_p, B, K, N);
+  } else if (x.scalar_type() == at::kBFloat16) {
+    const bf16* x_p   = reinterpret_cast<const bf16*>(x.data_ptr<at::BFloat16>());
+    const bf16* sc_p  = reinterpret_cast<const bf16*>(scales.data_ptr<at::BFloat16>());
+    bf16*       out_p = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    launch_awq_moe_gated_np_esimd<bf16, 16, 128>(
+        q, x_p, qw_p, qz_p, sc_p, eid_p, out_p, B, K, N);
+  } else {
+    TORCH_CHECK(false, "Unsupported dtype: ", x.scalar_type());
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reduce kernel (w2): SLM K-split + topk-weighted reduce.
+// Range = (1, num_n_tiles * GS), local = (1, GS). Accumulates across all
+// B=top_k experts inside the kernel before SLM reduce.
+//
+//   hidden   [B, K_in]               bf16/fp16
+//   qweight  [E, K_in, N/8]          int32
+//   qzeros   [E, K_in/G, N/8]        int32
+//   scales   [E, K_in/G, N]          bf16/fp16
+//   topk_w   [B]                     bf16/fp16
+// Output:
+//   out      [N]                     bf16/fp16
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename IT, int GS, int kGroupSize>
+void launch_awq_moe_reduce_np_esimd(
+    sycl::queue& q,
+    const IT* hidden,
+    const int32_t* qweight,
+    const int32_t* qzeros,
+    const IT* scales,
+    const int* expert_ids,
+    const IT* topk_weights,
+    IT* out,
+    int B, int K_in, int N) {
+  constexpr int kPacksPerTile = 16;
+  constexpr int kColsPerTile = kPacksPerTile * 8;
+  const int packed_stride = N / 8;
+  const int K_groups = K_in / kGroupSize;
+  const int num_n_tiles = N / kColsPerTile;
+
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(1, static_cast<size_t>(num_n_tiles) * GS),
+            sycl::range<2>(1, GS)),
+        [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+          slm_init<GS * kColsPerTile * sizeof(float)>();
+
+          const int tile_idx = (int)item.get_group(1);
+          const int tid      = (int)item.get_local_id(1);
+          const int n_col_start = tile_idx * kColsPerTile;
+          const int packed_n_base = tile_idx * kPacksPerTile;
+
+          // Per-thread accumulator: weighted sum across all B experts.
+          simd<float, kColsPerTile> total(0.f);
+
+          for (int b = 0; b < B; b++) {
+            const int eid = expert_ids[b];
+            const float w = (float)(IT)topk_weights[b];
+
+            const int32_t* qw_e = qweight + (size_t)eid * K_in * packed_stride;
+            const int32_t* qz_e = qzeros  + (size_t)eid * K_groups * packed_stride;
+            const IT*      sc_e = scales  + (size_t)eid * K_groups * N;
+            const IT*      hi   = hidden  + (size_t)b * K_in;
+
+            simd<float, kColsPerTile> acc(0.f);
+            int last_g = -1;
+            simd<float, kColsPerTile> scale_v(0.f);
+            simd<float, kColsPerTile> offset_v(0.f);
+
+            for (int k = tid; k < K_in; k += GS) {
+              int g = k / kGroupSize;
+              if (g != last_g) {
+                simd<int32_t, kPacksPerTile> qz_v = block_load<int32_t, kPacksPerTile>(
+                    qz_e + (size_t)g * packed_stride + packed_n_base);
+                simd<IT, kColsPerTile> sc_raw = block_load<IT, kColsPerTile>(
+                    sc_e + (size_t)g * N + n_col_start);
+                scale_v = convert<float>(sc_raw);
+                simd<float, kColsPerTile> qz_f;
+                #pragma unroll
+                for (int o = 0; o < 8; o++) {
+                  int shift = 4 * kAwqPackOrder[o];
+                  simd<int32_t, kPacksPerTile> nz = (qz_v >> shift) & 0xF;
+                  qz_f.template select<kPacksPerTile, 8>(o) = convert<float>(nz);
+                }
+                offset_v = -qz_f * scale_v;
+                last_g = g;
+              }
+
+              simd<int32_t, kPacksPerTile> qw_v = block_load<int32_t, kPacksPerTile>(
+                  qw_e + (size_t)k * packed_stride + packed_n_base);
+              simd<float, kColsPerTile> nib_f;
+              #pragma unroll
+              for (int o = 0; o < 8; o++) {
+                int shift = 4 * kAwqPackOrder[o];
+                simd<int32_t, kPacksPerTile> nv = (qw_v >> shift) & 0xF;
+                nib_f.template select<kPacksPerTile, 8>(o) = convert<float>(nv);
+              }
+              simd<float, kColsPerTile> dq = nib_f * scale_v + offset_v;
+              float hv = (float)(IT)hi[k];
+              acc += dq * hv;
+            }
+            total += acc * w;
+          }
+
+          uint32_t slm_off = (uint32_t)(tid * kColsPerTile) * 4u;
+          slm_block_store<float, kColsPerTile>(slm_off, total);
+          barrier();
+
+          if (tid == 0) {
+            simd<float, kColsPerTile> sum(0.f);
+            #pragma unroll
+            for (int i = 0; i < GS; i++) {
+              sum += slm_block_load<float, kColsPerTile>(
+                  (uint32_t)(i * kColsPerTile) * 4u);
+            }
+            block_store<IT, kColsPerTile>(out + n_col_start, convert<IT>(sum));
+          }
+        });
+  });
+}
+
+at::Tensor awq_moe_reduce_np_esimd(
+    at::Tensor hidden,
+    at::Tensor qweight,
+    at::Tensor scales,
+    at::Tensor qzeros,
+    at::Tensor expert_ids,
+    at::Tensor topk_weights) {
+  TORCH_CHECK(hidden.is_xpu() && qweight.is_xpu() && scales.is_xpu() &&
+              qzeros.is_xpu() && expert_ids.is_xpu() &&
+              topk_weights.is_xpu());
+  TORCH_CHECK(qweight.scalar_type() == at::kInt);
+  TORCH_CHECK(qzeros.scalar_type() == at::kInt);
+  TORCH_CHECK(expert_ids.scalar_type() == at::kInt);
+  TORCH_CHECK(hidden.dim() == 2);
+  TORCH_CHECK(scales.scalar_type() == hidden.scalar_type());
+  TORCH_CHECK(topk_weights.scalar_type() == hidden.scalar_type());
+
+  const int E = static_cast<int>(qweight.size(0));
+  const int K_in = static_cast<int>(qweight.size(1));
+  const int packed_N = static_cast<int>(qweight.size(2));
+  const int N = packed_N * 8;
+  const int K_groups = static_cast<int>(scales.size(1));
+  const int group_size = K_in / K_groups;
+  const int B = static_cast<int>(expert_ids.numel());
+  (void)E;
+
+  TORCH_CHECK(hidden.size(0) == B && hidden.size(1) == K_in);
+  TORCH_CHECK(N % 128 == 0);
+  TORCH_CHECK(K_in % 16 == 0);
+  TORCH_CHECK(group_size == 128);
+
+  auto out = at::empty({N}, hidden.options());
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  const int32_t* qw_p  = qweight.data_ptr<int32_t>();
+  const int32_t* qz_p  = qzeros.data_ptr<int32_t>();
+  const int*     eid_p = expert_ids.data_ptr<int>();
+
+  if (hidden.scalar_type() == at::kHalf) {
+    const fp16* hi_p  = reinterpret_cast<const fp16*>(hidden.data_ptr<at::Half>());
+    const fp16* sc_p  = reinterpret_cast<const fp16*>(scales.data_ptr<at::Half>());
+    const fp16* tw_p  = reinterpret_cast<const fp16*>(topk_weights.data_ptr<at::Half>());
+    fp16*       out_p = reinterpret_cast<fp16*>(out.data_ptr<at::Half>());
+    launch_awq_moe_reduce_np_esimd<fp16, 16, 128>(
+        q, hi_p, qw_p, qz_p, sc_p, eid_p, tw_p, out_p, B, K_in, N);
+  } else if (hidden.scalar_type() == at::kBFloat16) {
+    const bf16* hi_p  = reinterpret_cast<const bf16*>(hidden.data_ptr<at::BFloat16>());
+    const bf16* sc_p  = reinterpret_cast<const bf16*>(scales.data_ptr<at::BFloat16>());
+    const bf16* tw_p  = reinterpret_cast<const bf16*>(topk_weights.data_ptr<at::BFloat16>());
+    bf16*       out_p = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    launch_awq_moe_reduce_np_esimd<bf16, 4, 128>(
+        q, hi_p, qw_p, qz_p, sc_p, eid_p, tw_p, out_p, B, K_in, N);
+  } else {
+    TORCH_CHECK(false, "Unsupported dtype: ", hidden.scalar_type());
+  }
+  return out;
+}
+
+}  // namespace
+
+TORCH_LIBRARY_FRAGMENT(awq_fused_xpu, m) {
+  m.def("awq_moe_gated_np_esimd(Tensor x, Tensor qweight, Tensor scales, "
+        "Tensor qzeros, Tensor expert_ids) -> Tensor");
+  m.def("awq_moe_reduce_np_esimd(Tensor hidden, Tensor qweight, Tensor scales, "
+        "Tensor qzeros, Tensor expert_ids, Tensor topk_weights) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(awq_fused_xpu, XPU, m) {
+  m.impl("awq_moe_gated_np_esimd", &awq_moe_gated_np_esimd);
+  m.impl("awq_moe_reduce_np_esimd", &awq_moe_reduce_np_esimd);
+}

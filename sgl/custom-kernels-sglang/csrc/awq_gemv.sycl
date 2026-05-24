@@ -1,0 +1,1110 @@
+// Fused AWQ dequant + GEMV for XPU.
+//
+// Public ops in this file:
+//   awq_fused_xpu::awq_gemv_fused           — non-repacked path (V1 kernel,
+//                                              works on any AWQ checkpoint)
+//   awq_fused_xpu::awq_repack_packed_n      — one-time layout transform
+//   awq_fused_xpu::awq_gemv_fused_repacked  — repacked-layout fast path
+//
+// AWQ logical layout (matches sgl-kernel-xpu/awq_dequantize.cpp):
+//   qweight: [K, N/8] int32  (8x int4 packed in row-major along N,
+//                             pack order = {0,4,1,5,2,6,3,7})
+//   qzeros : [K/group, N/8] int32
+//   scales : [K/group, N]   bf16/fp16
+//   x      : [M, K]          bf16/fp16  (M expected to be 1; we still loop)
+//   out    : [M, N]          bf16/fp16
+//
+// Repacked physical layout (kBlockK = 16):
+//   qweight_repacked: [N/8, K/kBlockK, kBlockK] int32, row-major
+//     Same elements but block-transposed so a sub-group's 16 lanes reading
+//     consecutive K values (lane k_in_block) of the SAME packed_n hit
+//     16 contiguous int32s = 1 cache line.
+//   qzeros stays unchanged in shape but we keep it as [K/group, N/8] for now
+//   (group reads are infrequent and already coalesced enough).
+//
+// Empirical note: on PTL iGPU the repacked path measures within ~5% of V1.
+// The hardware coalescer / L1 cache already merges V1's "strided in K" reads
+// effectively, so the layout change doesn't unlock additional bandwidth.
+// We still keep the repacked kernel + repack op available in case it helps
+// other XPUs (BMG, ARC) where the coalescer is less forgiving.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <sycl/sycl.hpp>
+#include <cstdint>
+
+namespace {
+
+constexpr int kSgSize = 16;       // sub-group width
+constexpr int kOutPerSg = 8;      // one int32 -> 8 dequantized outputs
+constexpr int kSgPerWg = 8;       // 8 sub-groups per work-group → 128 lanes
+constexpr int kBlockK = 16;       // K-tile size in repacked layout (= kSgSize)
+
+// Helper: cast fp32 scratch back to T (used by all K-split paths).
+template <typename T>
+struct CastFp32ToT {
+  const float* in_fp32;
+  T* out;
+  int total;
+
+  void operator()(sycl::id<1> idx) const {
+    int i = idx[0];
+    if (i < total) out[i] = static_cast<T>(in_fp32[i]);
+  }
+};
+
+// =============================================================================
+// "fp32-prepacked" variants take pre-converted fp32 scales and pre-unpacked
+// fp32 zero-points (8 floats per packed_n per group). This avoids the
+// per-K-iter bf16->fp32 cast and the per-group qzero shift+mask. Memory
+// trade-off: scales x2 (bf16 -> fp32), zeros x8 (one int per group -> 8
+// floats per group). For Qwen3.5-AWQ this is ~7 MB extra per model.
+// =============================================================================
+// V1 kernel: non-repacked layout. One sub-group per packed_n column;
+// lanes parallelise K-dim by stride 16, sub-group reduce at the end.
+//
+// NB: when kKSplit > 1, multiple sub-groups cooperate on the SAME packed_n
+// column. Each sub-group covers 1/kKSplit of the K range and atomic-adds its
+// partial output. This keeps WG count high when N is small (down_proj-like
+// shapes) without losing the simple K-stride access pattern.
+// =============================================================================
+template <typename T, int kGroupSize>
+struct AWQGemvKernelV1Tmpl {
+  const int* qweight;   // [K, N/8]
+  const int* qzeros;    // [K/group, N/8]
+  const T* scales;      // [K/group, N]
+  const T* x;           // [M, K]
+  T* out;               // [M, N]
+  int M, K, N;          // group_size templated away
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (m >= M || packed_n * kOutPerSg >= N) return;
+
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / 8;
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    int qz_cached = 0;
+    float sc_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) sc_cached[o] = 0.f;
+
+    for (int k = sg_local_id; k < K; k += kSgSize) {
+      const int g = k / kGroupSize;
+      if (g != last_g) {
+        qz_cached = qzeros[g * packed_stride + packed_n];
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = static_cast<float>(scales[g * N + n_base + o]);
+        }
+        last_g = g;
+      }
+      const int qw = qweight[k * packed_stride + packed_n];
+      const float xv = static_cast<float>(x[m * K + k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_int) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      out[m * N + n_base + sg_local_id] = static_cast<T>(acc[sg_local_id]);
+    }
+  }
+};
+
+// Runtime fallback (non-templated group_size).
+template <typename T>
+struct AWQGemvKernelV1 {
+  const int* qweight;
+  const int* qzeros;
+  const T* scales;
+  const T* x;
+  T* out;
+  int M, K, N, group_size;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (m >= M || packed_n * kOutPerSg >= N) return;
+
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / 8;
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    int qz_cached = 0;
+    float sc_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) sc_cached[o] = 0.f;
+
+    for (int k = sg_local_id; k < K; k += kSgSize) {
+      const int g = k / group_size;
+      if (g != last_g) {
+        qz_cached = qzeros[g * packed_stride + packed_n];
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = static_cast<float>(scales[g * N + n_base + o]);
+        }
+        last_g = g;
+      }
+      const int qw = qweight[k * packed_stride + packed_n];
+      const float xv = static_cast<float>(x[m * K + k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_int) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      out[m * N + n_base + sg_local_id] = static_cast<T>(acc[sg_local_id]);
+    }
+  }
+};
+
+template <typename T>
+void launch_awq_gemv_v1(
+    sycl::queue& q,
+    const int* qweight, const int* qzeros, const T* scales, const T* x, T* out,
+    int M, int K, int N, int group_size, at::Tensor& /*unused*/) {
+  const int wg_n = kSgSize * kSgPerWg;
+  const int packed_n_count = N / kOutPerSg;
+  const int packed_groups = (packed_n_count + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(static_cast<size_t>(M),
+                        static_cast<size_t>(packed_groups) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  // Specialise common group_size = 128 for compile-time div optimisation.
+  if (group_size == 128) {
+    AWQGemvKernelV1Tmpl<T, 128> kfn{qweight, qzeros, scales, x, out, M, K, N};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else {
+    AWQGemvKernelV1<T> kfn{qweight, qzeros, scales, x, out, M, K, N, group_size};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  }
+}
+
+// =============================================================================
+// V1 kernel — fp32-prepacked variant.
+//   scales_fp32  : [K/group, N]              float
+//   zeros_fp32   : [K/group, N]              float   (8 unpacked zeros per packed_n,
+//                                                    laid out same as scales)
+// Saves: bf16->fp32 cast (8 per group switch) + integer shift/mask for zeros
+// (8 per group switch).
+// =============================================================================
+template <typename T>
+struct AWQGemvKernelV1Pp {
+  const int* qweight;       // [K, N/8]
+  const float* zeros_fp32;  // [K/group, N]
+  const float* scales_fp32; // [K/group, N]
+  const T* x;               // [M, K]
+  T* out;                   // [M, N]
+  int M, K, N, group_size;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (m >= M || packed_n * kOutPerSg >= N) return;
+
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / 8;
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    float sc_cached[kOutPerSg];
+    float z_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) { sc_cached[o] = 0.f; z_cached[o] = 0.f; }
+
+    for (int k = sg_local_id; k < K; k += kSgSize) {
+      const int g = k / group_size;
+      if (g != last_g) {
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = scales_fp32[g * N + n_base + o];
+          z_cached[o]  = zeros_fp32[g * N + n_base + o];
+        }
+        last_g = g;
+      }
+      const int qw = qweight[k * packed_stride + packed_n];
+      const float xv = static_cast<float>(x[m * K + k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_cached[o]) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      out[m * N + n_base + sg_local_id] = static_cast<T>(acc[sg_local_id]);
+    }
+  }
+};
+
+template <typename T>
+void launch_awq_gemv_v1_pp(
+    sycl::queue& q,
+    const int* qweight, const float* zeros_fp32, const float* scales_fp32,
+    const T* x, T* out,
+    int M, int K, int N, int group_size) {
+  const int wg_n = kSgSize * kSgPerWg;
+  const int packed_n_count = N / kOutPerSg;
+  const int packed_groups = (packed_n_count + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(static_cast<size_t>(M),
+                        static_cast<size_t>(packed_groups) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  AWQGemvKernelV1Pp<T> kfn{qweight, zeros_fp32, scales_fp32, x, out,
+                            M, K, N, group_size};
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+  });
+}
+
+// =============================================================================
+// V1+K-split prepacked variant.
+// =============================================================================
+template <typename T, int kKSplit>
+struct AWQGemvKernelV1KSplitPp {
+  const int* qweight;
+  const float* zeros_fp32;
+  const float* scales_fp32;
+  const T* x;
+  float* out_fp32;
+  int M, K, N, group_size;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    static_assert(kSgPerWg % kKSplit == 0,
+                  "kSgPerWg must be divisible by kKSplit");
+    constexpr int kPnPerWg = kSgPerWg / kKSplit;
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int k_split_id = sg_id_in_wg / kPnPerWg;
+    const int pn_in_wg   = sg_id_in_wg % kPnPerWg;
+    const int packed_n   = wg_id_n * kPnPerWg + pn_in_wg;
+    if (m >= M || packed_n * kOutPerSg >= N) return;
+
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / 8;
+
+    const int seg_len = (K + kKSplit - 1) / kKSplit;
+    const int k_lo = k_split_id * seg_len;
+    const int k_hi = sycl::min((k_split_id + 1) * seg_len, K);
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    float sc_cached[kOutPerSg];
+    float z_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) { sc_cached[o] = 0.f; z_cached[o] = 0.f; }
+
+    for (int k = k_lo + sg_local_id; k < k_hi; k += kSgSize) {
+      const int g = k / group_size;
+      if (g != last_g) {
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = scales_fp32[g * N + n_base + o];
+          z_cached[o]  = zeros_fp32[g * N + n_base + o];
+        }
+        last_g = g;
+      }
+      const int qw = qweight[k * packed_stride + packed_n];
+      const float xv = static_cast<float>(x[m * K + k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_cached[o]) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      const int idx = m * N + n_base + sg_local_id;
+      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                        sycl::memory_scope::device,
+                        sycl::access::address_space::global_space>
+          ar(out_fp32[idx]);
+      ar.fetch_add(acc[sg_local_id]);
+    }
+  }
+};
+
+template <typename T, int kKSplit>
+void launch_awq_gemv_v1_ksplit_pp(
+    sycl::queue& q,
+    const int* qweight, const float* zeros_fp32, const float* scales_fp32,
+    const T* x, T* out,
+    int M, int K, int N, int group_size, at::Tensor& out_tensor) {
+  static_assert(kSgPerWg % kKSplit == 0, "kSgPerWg must be divisible by kKSplit");
+  constexpr int kPnPerWg = kSgPerWg / kKSplit;
+
+  auto scratch = at::zeros({M, N}, out_tensor.options().dtype(at::kFloat));
+  float* scratch_p = scratch.data_ptr<float>();
+
+  const int wg_n = kSgSize * kSgPerWg;
+  const int packed_n_count = N / kOutPerSg;
+  const int packed_groups = (packed_n_count + kPnPerWg - 1) / kPnPerWg;
+  sycl::range<2> global(static_cast<size_t>(M),
+                        static_cast<size_t>(packed_groups) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  AWQGemvKernelV1KSplitPp<T, kKSplit> kfn{qweight, zeros_fp32, scales_fp32, x,
+                                          scratch_p, M, K, N, group_size};
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+  });
+
+  const int total = M * N;
+  q.submit([&](sycl::handler& cgh) {
+    CastFp32ToT<T> caster{scratch_p, out, total};
+    cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), caster);
+  });
+}
+
+// =============================================================================
+// Prepack: convert (scales[bf16/fp16], qzeros[int32 packed]) into
+//   scales_fp32  : [K/group, N]  float
+//   zeros_fp32   : [K/group, N]  float  (each packed int unpacked into 8 floats)
+// =============================================================================
+template <typename T>
+struct AWQPrepackKernel {
+  const T* scales;        // [K/group, N]
+  const int* qzeros;      // [K/group, N/8]
+  float* scales_fp32;     // [K/group, N]
+  float* zeros_fp32;      // [K/group, N]
+  int n_groups;
+  int N;
+
+  void operator()(sycl::id<2> idx) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    int g = idx[0];
+    int packed_n = idx[1];
+    if (g >= n_groups || packed_n * 8 >= N) return;
+
+    const int qz = qzeros[g * (N / 8) + packed_n];
+    #pragma unroll
+    for (int o = 0; o < 8; ++o) {
+      const int shift = 4 * orders[o];
+      zeros_fp32[g * N + packed_n * 8 + o] = static_cast<float>((qz >> shift) & 0xF);
+      scales_fp32[g * N + packed_n * 8 + o] =
+          static_cast<float>(scales[g * N + packed_n * 8 + o]);
+    }
+  }
+};
+
+std::vector<at::Tensor> awq_prepack_scales_zeros(
+    at::Tensor scales, at::Tensor qzeros) {
+  TORCH_CHECK(scales.dim() == 2 && qzeros.dim() == 2);
+  TORCH_CHECK(scales.is_xpu() && qzeros.is_xpu());
+  TORCH_CHECK(qzeros.scalar_type() == at::kInt);
+
+  const int n_groups = scales.size(0);
+  const int N = scales.size(1);
+  TORCH_CHECK(qzeros.size(0) == n_groups);
+  TORCH_CHECK(qzeros.size(1) == N / 8);
+
+  auto opts_f = scales.options().dtype(at::kFloat);
+  auto scales_fp32 = at::empty({n_groups, N}, opts_f);
+  auto zeros_fp32  = at::empty({n_groups, N}, opts_f);
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  sycl::range<2> global(n_groups, N / 8);
+
+  if (scales.scalar_type() == at::kHalf) {
+    AWQPrepackKernel<sycl::half> kfn{
+        reinterpret_cast<const sycl::half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<const int*>(qzeros.data_ptr<int>()),
+        scales_fp32.data_ptr<float>(),
+        zeros_fp32.data_ptr<float>(),
+        n_groups, N};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(global, kfn);
+    });
+  } else if (scales.scalar_type() == at::kBFloat16) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    AWQPrepackKernel<bf16> kfn{
+        reinterpret_cast<const bf16*>(scales.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const int*>(qzeros.data_ptr<int>()),
+        scales_fp32.data_ptr<float>(),
+        zeros_fp32.data_ptr<float>(),
+        n_groups, N};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(global, kfn);
+    });
+  } else {
+    TORCH_CHECK(false, "Unsupported scales dtype: ", scales.scalar_type());
+  }
+  return {scales_fp32, zeros_fp32};
+}
+
+// =============================================================================
+// Public entry point for the prepacked path.
+// =============================================================================
+at::Tensor awq_gemv_fused_pp(
+    at::Tensor x,
+    at::Tensor qweight,
+    at::Tensor scales_fp32,
+    at::Tensor zeros_fp32) {
+  TORCH_CHECK(qweight.dim() == 2 && scales_fp32.dim() == 2 && zeros_fp32.dim() == 2);
+  TORCH_CHECK(x.is_xpu() && qweight.is_xpu()
+              && scales_fp32.is_xpu() && zeros_fp32.is_xpu());
+  TORCH_CHECK(qweight.scalar_type() == at::kInt);
+  TORCH_CHECK(scales_fp32.scalar_type() == at::kFloat
+              && zeros_fp32.scalar_type() == at::kFloat);
+
+  const int K = static_cast<int>(qweight.size(0));
+  const int packed_N = static_cast<int>(qweight.size(1));
+  const int N = packed_N * 8;
+  const int group_size = K / static_cast<int>(scales_fp32.size(0));
+  const int M = static_cast<int>(x.numel() / K);
+
+  TORCH_CHECK(scales_fp32.size(1) == N);
+  TORCH_CHECK(zeros_fp32.size(1) == N);
+
+  auto out_shape = x.sizes().vec();
+  out_shape.back() = N;
+  auto out = at::empty(out_shape, x.options());
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  const int* qw_p   = reinterpret_cast<const int*>(qweight.data_ptr<int>());
+  const float* sc_p = scales_fp32.data_ptr<float>();
+  const float* z_p  = zeros_fp32.data_ptr<float>();
+
+  // Same dispatch heuristic as awq_gemv_fused.
+  const int n_packed_n = N / 8;
+  const int n_sgs_v1 = (n_packed_n + kSgPerWg - 1) / kSgPerWg;
+  const bool need_split = (n_sgs_v1 < 64) && (K >= 2048);
+  int ksplit = 1;
+  if (need_split) {
+    if (K >= 4 * N || n_sgs_v1 < 32) ksplit = 4;
+    else if (K >= 2 * N || n_sgs_v1 < 48) ksplit = 2;
+  }
+
+  if (x.scalar_type() == at::kHalf) {
+    auto x_p   = reinterpret_cast<const sycl::half*>(x.data_ptr<at::Half>());
+    auto out_p = reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
+    if (ksplit == 4) launch_awq_gemv_v1_ksplit_pp<sycl::half, 4>(q, qw_p, z_p, sc_p, x_p, out_p, M, K, N, group_size, out);
+    else if (ksplit == 2) launch_awq_gemv_v1_ksplit_pp<sycl::half, 2>(q, qw_p, z_p, sc_p, x_p, out_p, M, K, N, group_size, out);
+    else launch_awq_gemv_v1_pp<sycl::half>(q, qw_p, z_p, sc_p, x_p, out_p, M, K, N, group_size);
+  } else if (x.scalar_type() == at::kBFloat16) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    auto x_p   = reinterpret_cast<const bf16*>(x.data_ptr<at::BFloat16>());
+    auto out_p = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    if (ksplit == 4) launch_awq_gemv_v1_ksplit_pp<bf16, 4>(q, qw_p, z_p, sc_p, x_p, out_p, M, K, N, group_size, out);
+    else if (ksplit == 2) launch_awq_gemv_v1_ksplit_pp<bf16, 2>(q, qw_p, z_p, sc_p, x_p, out_p, M, K, N, group_size, out);
+    else launch_awq_gemv_v1_pp<bf16>(q, qw_p, z_p, sc_p, x_p, out_p, M, K, N, group_size);
+  } else {
+    TORCH_CHECK(false, "Unsupported x dtype: ", x.scalar_type());
+  }
+  return out;
+}
+
+// =============================================================================
+// V1ks kernel: V1 + K-split with float atomic.
+//   When N is small (down_proj-like) we don't have enough sub-groups to keep
+//   the GPU busy. Splitting K across kKSplit cooperating sub-groups (each
+//   processing the SAME packed_n, different K segments) raises the WG count
+//   by kKSplit. The partial fp32 outputs are accumulated into a fp32
+//   scratch buffer via atomic add, then a small post-kernel casts to T.
+// =============================================================================
+template <typename T, int kKSplit, int kGroupSize>
+struct AWQGemvKernelV1KSplitTmpl {
+  const int* qweight;
+  const int* qzeros;
+  const T* scales;
+  const T* x;
+  float* out_fp32;
+  int M, K, N;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    static_assert(kSgPerWg % kKSplit == 0,
+                  "kSgPerWg must be divisible by kKSplit");
+    constexpr int kPnPerWg = kSgPerWg / kKSplit;
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int k_split_id = sg_id_in_wg / kPnPerWg;
+    const int pn_in_wg   = sg_id_in_wg % kPnPerWg;
+    const int packed_n   = wg_id_n * kPnPerWg + pn_in_wg;
+    if (m >= M || packed_n * kOutPerSg >= N) return;
+
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / 8;
+
+    const int seg_len = (K + kKSplit - 1) / kKSplit;
+    const int k_lo = k_split_id * seg_len;
+    const int k_hi = sycl::min((k_split_id + 1) * seg_len, K);
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    int qz_cached = 0;
+    float sc_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) sc_cached[o] = 0.f;
+
+    for (int k = k_lo + sg_local_id; k < k_hi; k += kSgSize) {
+      const int g = k / kGroupSize;
+      if (g != last_g) {
+        qz_cached = qzeros[g * packed_stride + packed_n];
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = static_cast<float>(scales[g * N + n_base + o]);
+        }
+        last_g = g;
+      }
+      const int qw = qweight[k * packed_stride + packed_n];
+      const float xv = static_cast<float>(x[m * K + k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_int) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      const int idx = m * N + n_base + sg_local_id;
+      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                        sycl::memory_scope::device,
+                        sycl::access::address_space::global_space>
+          ar(out_fp32[idx]);
+      ar.fetch_add(acc[sg_local_id]);
+    }
+  }
+};
+
+// Runtime fallback (non-templated group_size).
+template <typename T, int kKSplit>
+struct AWQGemvKernelV1KSplit {
+  const int* qweight;
+  const int* qzeros;
+  const T* scales;
+  const T* x;
+  float* out_fp32;
+  int M, K, N, group_size;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    static_assert(kSgPerWg % kKSplit == 0,
+                  "kSgPerWg must be divisible by kKSplit");
+    constexpr int kPnPerWg = kSgPerWg / kKSplit;
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int k_split_id = sg_id_in_wg / kPnPerWg;
+    const int pn_in_wg   = sg_id_in_wg % kPnPerWg;
+    const int packed_n   = wg_id_n * kPnPerWg + pn_in_wg;
+    if (m >= M || packed_n * kOutPerSg >= N) return;
+
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_stride = N / 8;
+
+    const int seg_len = (K + kKSplit - 1) / kKSplit;
+    const int k_lo = k_split_id * seg_len;
+    const int k_hi = sycl::min((k_split_id + 1) * seg_len, K);
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    int qz_cached = 0;
+    float sc_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) sc_cached[o] = 0.f;
+
+    for (int k = k_lo + sg_local_id; k < k_hi; k += kSgSize) {
+      const int g = k / group_size;
+      if (g != last_g) {
+        qz_cached = qzeros[g * packed_stride + packed_n];
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = static_cast<float>(scales[g * N + n_base + o]);
+        }
+        last_g = g;
+      }
+      const int qw = qweight[k * packed_stride + packed_n];
+      const float xv = static_cast<float>(x[m * K + k]);
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_int) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      const int idx = m * N + n_base + sg_local_id;
+      sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                        sycl::memory_scope::device,
+                        sycl::access::address_space::global_space>
+          ar(out_fp32[idx]);
+      ar.fetch_add(acc[sg_local_id]);
+    }
+  }
+};
+
+template <typename T, int kKSplit>
+void launch_awq_gemv_v1_ksplit(
+    sycl::queue& q,
+    const int* qweight, const int* qzeros, const T* scales, const T* x, T* out,
+    int M, int K, int N, int group_size, at::Tensor& out_tensor) {
+  static_assert(kSgPerWg % kKSplit == 0, "kSgPerWg must be divisible by kKSplit");
+  constexpr int kPnPerWg = kSgPerWg / kKSplit;
+
+  // Allocate fp32 scratch matching out shape.
+  auto scratch = at::zeros({M, N}, out_tensor.options().dtype(at::kFloat));
+  float* scratch_p = scratch.data_ptr<float>();
+
+  const int wg_n = kSgSize * kSgPerWg;
+  const int packed_n_count = N / kOutPerSg;
+  const int packed_groups = (packed_n_count + kPnPerWg - 1) / kPnPerWg;
+  sycl::range<2> global(static_cast<size_t>(M),
+                        static_cast<size_t>(packed_groups) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  if (group_size == 128) {
+    AWQGemvKernelV1KSplitTmpl<T, kKSplit, 128> kfn{
+        qweight, qzeros, scales, x, scratch_p, M, K, N};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  } else {
+    AWQGemvKernelV1KSplit<T, kKSplit> kfn{qweight, qzeros, scales, x,
+                                          scratch_p, M, K, N, group_size};
+    q.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+    });
+  }
+
+  const int total = M * N;
+  q.submit([&](sycl::handler& cgh) {
+    CastFp32ToT<T> caster{scratch_p, out, total};
+    cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), caster);
+  });
+}
+
+// =============================================================================
+// Repack kernel: qweight [K, N/8] -> [N/8, K/kBlockK, kBlockK].
+//
+// Each output element (packed_n, k_block, k_in_block) reads from input
+//   qweight[k_block*kBlockK + k_in_block, packed_n].
+// We launch one work-item per output element; access pattern in the destination
+// is row-major contiguous, source is strided. Runs once at model load.
+// =============================================================================
+struct AWQRepackKernel {
+  const int* src;       // [K, packed_N]
+  int* dst;             // [packed_N, K/kBlockK, kBlockK]
+  int K;
+  int packed_N;
+
+  void operator()(sycl::nd_item<3> item) const {
+    const int packed_n   = item.get_global_id(0);
+    const int k_block    = item.get_global_id(1);
+    const int k_in_block = item.get_global_id(2);
+    if (packed_n >= packed_N || k_block * kBlockK + k_in_block >= K) return;
+
+    const int k = k_block * kBlockK + k_in_block;
+    const int src_idx = k * packed_N + packed_n;
+    const int dst_idx = packed_n * (K / kBlockK) * kBlockK
+                      + k_block * kBlockK + k_in_block;
+    dst[dst_idx] = src[src_idx];
+  }
+};
+
+at::Tensor awq_repack_packed_n(at::Tensor qweight) {
+  TORCH_CHECK(qweight.dim() == 2);
+  TORCH_CHECK(qweight.is_xpu());
+  TORCH_CHECK(qweight.scalar_type() == at::kInt);
+
+  const int K = static_cast<int>(qweight.size(0));
+  const int packed_N = static_cast<int>(qweight.size(1));
+  TORCH_CHECK(K % kBlockK == 0, "K must be a multiple of ", kBlockK);
+
+  auto out = at::empty({packed_N, K / kBlockK, kBlockK}, qweight.options());
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  sycl::range<3> global(packed_N, K / kBlockK, kBlockK);
+  sycl::range<3> local(1, 1, kBlockK);
+
+  AWQRepackKernel kfn{
+      reinterpret_cast<const int*>(qweight.data_ptr<int>()),
+      reinterpret_cast<int*>(out.data_ptr<int>()),
+      K, packed_N};
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::nd_range<3>(global, local), kfn);
+  });
+  return out;
+}
+
+// =============================================================================
+// Repacked-layout fused GEMV.
+//
+// Layout of qweight_repacked: [N/8, K/kBlockK, kBlockK]
+//
+// Mapping:
+//   - Each sub-group of 16 lanes owns ONE packed_n column.
+//   - K loop iterates  k_block = 0 .. K/kBlockK - 1.  At each step:
+//       - 16 lanes load qweight_repacked[packed_n][k_block][lane]
+//         -> 16 contiguous int32s = 1 cache line, fully coalesced.
+//       - 16 lanes load x[m][k_block * kBlockK + lane], also contiguous.
+//       - Each lane does its own dequant + multiply-add into 8 partial accs
+//         (one per output column).
+//   - At the end, sub-group reduce all 8 accs.
+//
+// Net change vs V1: HBM access for qweight switches from
+//   "16 strided int32 reads (16 cache lines)"  to
+//   "16 contiguous int32 reads (1 cache line)".
+// =============================================================================
+template <typename T>
+struct AWQGemvKernelRepacked {
+  const int* qweight;   // [packed_N, K/kBlockK, kBlockK]
+  const int* qzeros;    // [K/group, packed_N]   (unchanged layout)
+  const T* scales;      // [K/group, N]           (unchanged layout)
+  const T* x;           // [M, K]
+  T* out;               // [M, N]
+  int M, K, N, group_size;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    constexpr int orders[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+    auto sg = item.get_sub_group();
+    const int sg_local_id = sg.get_local_id()[0];   // 0..15 = k_in_block
+    const int m = item.get_global_id(0);
+
+    const int wg_id_n = item.get_group(1);
+    const int sg_id_in_wg = item.get_local_id(1) / kSgSize;
+    const int packed_n = wg_id_n * kSgPerWg + sg_id_in_wg;
+    if (m >= M || packed_n * kOutPerSg >= N) return;
+
+    const int n_base = packed_n * kOutPerSg;
+    const int packed_N = N / 8;
+    const int K_blocks = K / kBlockK;
+
+    // Base pointer for this sub-group's qweight rows: [packed_n, :, :].
+    const int* qw_base = qweight + packed_n * (K_blocks * kBlockK);
+
+    float acc[kOutPerSg] = {0.f};
+    int last_g = -1;
+    int qz_cached = 0;
+    float sc_cached[kOutPerSg];
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) sc_cached[o] = 0.f;
+
+    for (int k_block = 0; k_block < K_blocks; ++k_block) {
+      // 16 lanes read 16 contiguous int32 from qweight_repacked.
+      const int qw = qw_base[k_block * kBlockK + sg_local_id];
+      // 16 lanes read 16 contiguous bf16 from x.
+      const int k = k_block * kBlockK + sg_local_id;
+      const float xv = static_cast<float>(x[m * K + k]);
+
+      const int g = k / group_size;
+      if (g != last_g) {
+        qz_cached = qzeros[g * packed_N + packed_n];
+        #pragma unroll
+        for (int o = 0; o < kOutPerSg; ++o) {
+          sc_cached[o] = static_cast<float>(scales[g * N + n_base + o]);
+        }
+        last_g = g;
+      }
+
+      #pragma unroll
+      for (int o = 0; o < kOutPerSg; ++o) {
+        const int shift = 4 * orders[o];
+        const float w_int = static_cast<float>((qw >> shift) & 0xF);
+        const float z_int = static_cast<float>((qz_cached >> shift) & 0xF);
+        acc[o] += xv * (w_int - z_int) * sc_cached[o];
+      }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < kOutPerSg; ++o) {
+      acc[o] = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+    }
+
+    if (sg_local_id < kOutPerSg) {
+      out[m * N + n_base + sg_local_id] = static_cast<T>(acc[sg_local_id]);
+    }
+  }
+};
+
+template <typename T>
+void launch_awq_gemv_repacked(
+    sycl::queue& q,
+    const int* qweight, const int* qzeros, const T* scales, const T* x, T* out,
+    int M, int K, int N, int group_size) {
+  const int wg_n = kSgSize * kSgPerWg;
+  const int packed_n_count = N / kOutPerSg;
+  const int packed_groups = (packed_n_count + kSgPerWg - 1) / kSgPerWg;
+  sycl::range<2> global(static_cast<size_t>(M),
+                        static_cast<size_t>(packed_groups) * wg_n);
+  sycl::range<2> local(1, wg_n);
+
+  AWQGemvKernelRepacked<T> kfn{qweight, qzeros, scales, x, out,
+                               M, K, N, group_size};
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+  });
+}
+
+}  // namespace
+
+at::Tensor awq_gemv_fused(
+    at::Tensor x,
+    at::Tensor qweight,
+    at::Tensor scales,
+    at::Tensor qzeros) {
+  TORCH_CHECK(qweight.dim() == 2 && scales.dim() == 2 && qzeros.dim() == 2);
+  TORCH_CHECK(x.is_xpu() && qweight.is_xpu() && scales.is_xpu() && qzeros.is_xpu());
+  TORCH_CHECK(qweight.scalar_type() == at::kInt && qzeros.scalar_type() == at::kInt);
+
+  const int K = static_cast<int>(qweight.size(0));
+  const int packed_N = static_cast<int>(qweight.size(1));
+  const int N = packed_N * 8;
+  const int group_size = K / static_cast<int>(scales.size(0));
+  const int M = static_cast<int>(x.numel() / K);
+
+  TORCH_CHECK(scales.size(1) == N, "scales col mismatch");
+  TORCH_CHECK(qzeros.size(1) == packed_N, "qzeros col mismatch");
+  TORCH_CHECK(scales.scalar_type() == x.scalar_type(),
+              "x dtype must match scales dtype");
+
+  auto out_shape = x.sizes().vec();
+  out_shape.back() = N;
+  auto out = at::empty(out_shape, x.options());
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  const int* qweight_ptr = reinterpret_cast<const int*>(qweight.data_ptr<int>());
+  const int* qzeros_ptr  = reinterpret_cast<const int*>(qzeros.data_ptr<int>());
+
+  // Heuristic: when K is large or close to N, V1 alone leaves the GPU
+  // under-occupied. Use V1+K-split to multiply the WG count.
+  //   - 4-way split when K >> N (severe down_proj imbalance)
+  //   - 2-way split when K is close to N (mild imbalance)
+  // ksplit=8 was tested but degraded end-to-end on Qwen3.5-4B-AWQ (atomic
+  // contention overhead overcame parallelism gains). Stick with up to 4.
+  const int n_packed_n = N / 8;
+  const int n_sgs_v1 = (n_packed_n + kSgPerWg - 1) / kSgPerWg;
+  const bool need_split = (n_sgs_v1 < 64) && (K >= 2048);
+  int ksplit = 1;
+  if (need_split) {
+    if (K >= 4 * N || n_sgs_v1 < 32) ksplit = 4;
+    else if (K >= 2 * N || n_sgs_v1 < 48) ksplit = 2;
+  }
+
+  if (scales.scalar_type() == at::kHalf) {
+    auto scales_p = reinterpret_cast<const sycl::half*>(scales.data_ptr<at::Half>());
+    auto x_p      = reinterpret_cast<const sycl::half*>(x.data_ptr<at::Half>());
+    auto out_p    = reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
+    if (ksplit == 8) {
+      launch_awq_gemv_v1_ksplit<sycl::half, 8>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size, out);
+    } else if (ksplit == 4) {
+      launch_awq_gemv_v1_ksplit<sycl::half, 4>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size, out);
+    } else if (ksplit == 2) {
+      launch_awq_gemv_v1_ksplit<sycl::half, 2>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size, out);
+    } else {
+      launch_awq_gemv_v1<sycl::half>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size, out);
+    }
+  } else if (scales.scalar_type() == at::kBFloat16) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    auto scales_p = reinterpret_cast<const bf16*>(scales.data_ptr<at::BFloat16>());
+    auto x_p      = reinterpret_cast<const bf16*>(x.data_ptr<at::BFloat16>());
+    auto out_p    = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    if (ksplit == 8) {
+      launch_awq_gemv_v1_ksplit<bf16, 8>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size, out);
+    } else if (ksplit == 4) {
+      launch_awq_gemv_v1_ksplit<bf16, 4>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size, out);
+    } else if (ksplit == 2) {
+      launch_awq_gemv_v1_ksplit<bf16, 2>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size, out);
+    } else {
+      launch_awq_gemv_v1<bf16>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size, out);
+    }
+  } else {
+    TORCH_CHECK(false, "Unsupported scales dtype: ", scales.scalar_type());
+  }
+  return out;
+}
+
+at::Tensor awq_gemv_fused_repacked(
+    at::Tensor x,
+    at::Tensor qweight_repacked,
+    at::Tensor scales,
+    at::Tensor qzeros,
+    int64_t N_in) {
+  TORCH_CHECK(qweight_repacked.dim() == 3, "qweight_repacked must be 3-D");
+  TORCH_CHECK(scales.dim() == 2 && qzeros.dim() == 2);
+  TORCH_CHECK(x.is_xpu() && qweight_repacked.is_xpu()
+              && scales.is_xpu() && qzeros.is_xpu());
+  TORCH_CHECK(qweight_repacked.scalar_type() == at::kInt
+              && qzeros.scalar_type() == at::kInt);
+
+  const int packed_N = static_cast<int>(qweight_repacked.size(0));
+  const int K_blocks = static_cast<int>(qweight_repacked.size(1));
+  const int block_k  = static_cast<int>(qweight_repacked.size(2));
+  TORCH_CHECK(block_k == kBlockK, "repacked block size must equal ", kBlockK);
+  const int K = K_blocks * block_k;
+  const int N = static_cast<int>(N_in);
+  TORCH_CHECK(N == packed_N * 8, "N must equal packed_N * 8");
+  const int group_size = K / static_cast<int>(scales.size(0));
+  const int M = static_cast<int>(x.numel() / K);
+
+  TORCH_CHECK(scales.size(1) == N, "scales col mismatch");
+  TORCH_CHECK(qzeros.size(1) == packed_N, "qzeros col mismatch");
+  TORCH_CHECK(scales.scalar_type() == x.scalar_type(),
+              "x dtype must match scales dtype");
+
+  auto out_shape = x.sizes().vec();
+  out_shape.back() = N;
+  auto out = at::empty(out_shape, x.options());
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+
+  const int* qweight_ptr =
+      reinterpret_cast<const int*>(qweight_repacked.data_ptr<int>());
+  const int* qzeros_ptr =
+      reinterpret_cast<const int*>(qzeros.data_ptr<int>());
+
+  if (scales.scalar_type() == at::kHalf) {
+    auto scales_p = reinterpret_cast<const sycl::half*>(scales.data_ptr<at::Half>());
+    auto x_p      = reinterpret_cast<const sycl::half*>(x.data_ptr<at::Half>());
+    auto out_p    = reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
+    launch_awq_gemv_repacked<sycl::half>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size);
+  } else if (scales.scalar_type() == at::kBFloat16) {
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    auto scales_p = reinterpret_cast<const bf16*>(scales.data_ptr<at::BFloat16>());
+    auto x_p      = reinterpret_cast<const bf16*>(x.data_ptr<at::BFloat16>());
+    auto out_p    = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
+    launch_awq_gemv_repacked<bf16>(q, qweight_ptr, qzeros_ptr, scales_p, x_p, out_p, M, K, N, group_size);
+  } else {
+    TORCH_CHECK(false, "Unsupported scales dtype: ", scales.scalar_type());
+  }
+  return out;
+}
+
+TORCH_LIBRARY_FRAGMENT(awq_fused_xpu, m) {
+  m.def("awq_gemv_fused(Tensor x, Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
+  m.def("awq_repack_packed_n(Tensor qweight) -> Tensor");
+  m.def("awq_gemv_fused_repacked(Tensor x, Tensor qweight_repacked, Tensor scales, Tensor qzeros, int N) -> Tensor");
+  m.def("awq_prepack_scales_zeros(Tensor scales, Tensor qzeros) -> Tensor[]");
+  m.def("awq_gemv_fused_pp(Tensor x, Tensor qweight, Tensor scales_fp32, Tensor zeros_fp32) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(awq_fused_xpu, XPU, m) {
+  m.impl("awq_gemv_fused", &awq_gemv_fused);
+  m.impl("awq_repack_packed_n", &awq_repack_packed_n);
+  m.impl("awq_gemv_fused_repacked", &awq_gemv_fused_repacked);
+  m.impl("awq_prepack_scales_zeros", &awq_prepack_scales_zeros);
+  m.impl("awq_gemv_fused_pp", &awq_gemv_fused_pp);
+}
+
+// Forward declarations for symbols defined in sibling .sycl files.
+at::Tensor dense_gemv(const at::Tensor& x, const at::Tensor& W);
+at::Tensor rmsnorm_gated(const at::Tensor& x, const at::Tensor& z,
+                         const at::Tensor& weight, double eps);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("awq_gemv_fused", &awq_gemv_fused, "fused awq dequant + gemv");
+  m.def("awq_repack_packed_n", &awq_repack_packed_n, "AWQ qweight repack into [N/8, K/16, 16] layout");
+  m.def("awq_gemv_fused_repacked", &awq_gemv_fused_repacked, "fused awq dequant + gemv on repacked qweight");
+  m.def("awq_prepack_scales_zeros", &awq_prepack_scales_zeros, "prepack scales/zeros to fp32");
+  m.def("awq_gemv_fused_pp", &awq_gemv_fused_pp, "fused awq gemv on prepacked scales/zeros");
+  m.def("dense_gemv", &dense_gemv, "dense bf16/fp16 GEMV");
+  m.def("rmsnorm_gated", &rmsnorm_gated, "fused RMSNorm + gated SiLU (GDN post-attn norm)");
+}

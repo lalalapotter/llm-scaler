@@ -1,0 +1,201 @@
+// Fused MoE router top-K with softmax + (optional) renormalize.
+//
+// Replaces the Python chain in sglang.layers.moe.topk.fused_topk_torch_native:
+//
+//   topk_weights = softmax(gating_output.float())     # over E experts
+//   topk_weights, topk_ids = torch.topk(topk_weights, top_k)
+//   if renormalize:
+//       topk_weights /= topk_weights.sum(-1, keepdim=True)
+//
+// On Qwen3.5-35B-A3B at decode this fires once per MoE layer (40 layers/step)
+// and the four-op chain costs ~14 ms/step due to launch overhead on tiny
+// (1, 256) tensors. One sub-group can do the whole thing in <1 us.
+//
+// Layout (per row, B=1 typical):
+//   - 1 work-group per row, 1 sub-group (16 lanes) per WG
+//   - each lane reads E/16 logits into private regs
+//   - sub-group reduce for softmax max and sum
+//   - K rounds of argmax (each is 1 sub-group reduce) for top-K
+//   - lane 0 renormalizes / final scale and writes results
+//
+// Renormalize math (see fused_topk_torch_native): when renormalize=True, the
+// global softmax denominator cancels:
+//   w_i = (exp_i / S_global) / sum_{j in topK}(exp_j / S_global)
+//       = exp_i / sum_{j in topK}(exp_j)
+// We exploit this: keep raw exp() values during selection, divide by their
+// own sum at the end. Saves one division per row.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+#include <torch/library.h>
+#include <sycl/sycl.hpp>
+#include <cstdint>
+
+namespace {
+
+constexpr int kSgSize = 16;
+constexpr int kMaxPerLane = 16;  // supports E up to 16*16=256
+constexpr int kMaxK = 16;        // supports top_k up to 16
+
+template <typename T>
+struct MoeRouteTopKKernel {
+  const T* logits;        // [B, E]
+  float*   topk_weights;  // [B, K]
+  int32_t* topk_ids;      // [B, K]
+  int B, E, K;
+  bool renormalize;
+
+  [[sycl::reqd_sub_group_size(kSgSize)]]
+  void operator()(sycl::nd_item<2> item) const {
+    auto sg = item.get_sub_group();
+    const int lane = sg.get_local_id()[0];
+    const int b = static_cast<int>(item.get_group(0));
+    if (b >= B) return;
+
+    const T* row = logits + (size_t)b * E;
+    const int per_lane = (E + kSgSize - 1) / kSgSize;
+
+    // Per-lane private buffers: logits this lane is responsible for.
+    float lvals[kMaxPerLane];
+    int   lidx[kMaxPerLane];
+    #pragma unroll
+    for (int i = 0; i < kMaxPerLane; i++) {
+      int e = lane + i * kSgSize;
+      if (i < per_lane && e < E) {
+        lvals[i] = static_cast<float>(row[e]);
+        lidx[i]  = e;
+      } else {
+        lvals[i] = -3.4e38f;
+        lidx[i]  = -1;
+      }
+    }
+
+    // 1) softmax: max + exp + sum (sub-group reduce twice)
+    float m = -3.4e38f;
+    #pragma unroll
+    for (int i = 0; i < kMaxPerLane; i++) m = sycl::max(m, lvals[i]);
+    m = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
+
+    float s = 0.f;
+    #pragma unroll
+    for (int i = 0; i < kMaxPerLane; i++) {
+      float e = sycl::native::exp(lvals[i] - m);
+      // Mask out padding entries so they never get selected as top-K.
+      if (lidx[i] < 0) e = 0.f;
+      lvals[i] = e;
+      s += e;
+    }
+    s = sycl::reduce_over_group(sg, s, sycl::plus<float>());
+    const float inv_s = 1.f / s;
+
+    // 2) top-K via K rounds of argmax. After each round, mask the winner with
+    //    -1 so it isn't picked again. K is small (8) so this is ~8 sub-group
+    //    reduces, which on PTL is on the order of a few hundred ns total.
+    for (int k = 0; k < K; k++) {
+      // local argmax across this lane's per-lane entries
+      float lmax = -3.4e38f;
+      int   lmax_pos = 0;
+      #pragma unroll
+      for (int i = 0; i < kMaxPerLane; i++) {
+        if (lvals[i] > lmax) {
+          lmax = lvals[i];
+          lmax_pos = i;
+        }
+      }
+      // global max value across the sub-group
+      float gmax = sycl::reduce_over_group(sg, lmax, sycl::maximum<float>());
+      // tie-break: smallest lane id that holds gmax (matches torch.topk's
+      // deterministic ordering closely enough — exact match isn't required)
+      int my_tie = (lmax == gmax) ? lane : (kSgSize + 1);
+      int winner_lane = sycl::reduce_over_group(sg, my_tie, sycl::minimum<int>());
+      // broadcast the winner's expert index
+      int my_eid = (lane == winner_lane) ? lidx[lmax_pos] : -1;
+      int winner_eid = sycl::reduce_over_group(sg, my_eid, sycl::maximum<int>());
+
+      if (lane == 0) {
+        topk_ids[b * K + k] = winner_eid;
+        topk_weights[b * K + k] = gmax;  // raw exp value, scale later
+      }
+      if (lane == winner_lane) {
+        lvals[lmax_pos] = -3.4e38f;
+      }
+    }
+
+    // 3) final scale: renormalize cancels the global softmax denom.
+    if (lane == 0) {
+      if (renormalize) {
+        float ssel = 0.f;
+        for (int k = 0; k < K; k++) ssel += topk_weights[b * K + k];
+        float inv = 1.f / ssel;
+        for (int k = 0; k < K; k++) topk_weights[b * K + k] *= inv;
+      } else {
+        for (int k = 0; k < K; k++) topk_weights[b * K + k] *= inv_s;
+      }
+    }
+  }
+};
+
+template <typename T>
+void launch_moe_route_topk(sycl::queue& q, const T* logits, float* w, int32_t* ids,
+                           int B, int E, int K, bool renormalize) {
+  MoeRouteTopKKernel<T> kfn{logits, w, ids, B, E, K, renormalize};
+  // 1 sub-group per row. Use range<2>(B, kSgSize) with local (1, kSgSize).
+  sycl::range<2> global(static_cast<size_t>(B), static_cast<size_t>(kSgSize));
+  sycl::range<2> local(1, static_cast<size_t>(kSgSize));
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::nd_range<2>(global, local), kfn);
+  });
+}
+
+}  // namespace
+
+std::tuple<at::Tensor, at::Tensor> moe_route_topk(
+    const at::Tensor& router_logits,
+    int64_t top_k,
+    bool renormalize) {
+  TORCH_CHECK(router_logits.is_xpu(), "moe_route_topk: router_logits must be XPU");
+  TORCH_CHECK(router_logits.dim() == 2, "moe_route_topk: router_logits must be 2-D");
+  const int B = static_cast<int>(router_logits.size(0));
+  const int E = static_cast<int>(router_logits.size(1));
+  const int K = static_cast<int>(top_k);
+  TORCH_CHECK(K > 0 && K <= kMaxK, "moe_route_topk: top_k out of range");
+  TORCH_CHECK(E <= kSgSize * kMaxPerLane,
+              "moe_route_topk: E > 256 not supported by this kernel");
+
+  auto logits = router_logits.contiguous();
+  auto opts_w = router_logits.options().dtype(at::kFloat);
+  auto opts_i = router_logits.options().dtype(at::kInt);
+  auto topk_w = at::empty({B, K}, opts_w);
+  auto topk_i = at::empty({B, K}, opts_i);
+
+  if (B == 0) return {topk_w, topk_i};
+
+  auto xpu_stream = c10::xpu::getCurrentXPUStream();
+  sycl::queue& q = xpu_stream.queue();
+  float*   wp = topk_w.data_ptr<float>();
+  int32_t* ip = topk_i.data_ptr<int32_t>();
+
+  if (logits.scalar_type() == at::kBFloat16) {
+    launch_moe_route_topk<c10::BFloat16>(
+        q, logits.data_ptr<c10::BFloat16>(), wp, ip, B, E, K, renormalize);
+  } else if (logits.scalar_type() == at::kHalf) {
+    launch_moe_route_topk<c10::Half>(
+        q, logits.data_ptr<c10::Half>(), wp, ip, B, E, K, renormalize);
+  } else if (logits.scalar_type() == at::kFloat) {
+    launch_moe_route_topk<float>(
+        q, logits.data_ptr<float>(), wp, ip, B, E, K, renormalize);
+  } else {
+    TORCH_CHECK(false, "moe_route_topk: unsupported dtype ", logits.scalar_type());
+  }
+  return {topk_w, topk_i};
+}
+
+TORCH_LIBRARY_FRAGMENT(awq_fused_xpu, m) {
+  m.def("moe_route_topk(Tensor router_logits, int top_k, bool renormalize) "
+        "-> (Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(awq_fused_xpu, XPU, m) {
+  m.impl("moe_route_topk", &moe_route_topk);
+}
