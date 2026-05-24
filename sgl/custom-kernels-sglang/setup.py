@@ -2,8 +2,8 @@
 on Intel PTL iGPU.
 
 Built extensions:
-  - awq_fused_xpu._C   (in-house SYCL: AWQ dequant+GEMV, MoE GEMV,
-                        dense GEMV, MoE routing, RMSNorm-gated, ESIMD MoE)
+  - awq_fused_xpu._C
+  - custom_esimd_kernels_sglang.custom_esimd_kernels  (esimd_qkv_split_norm_rope ...)
 """
 import os
 from pathlib import Path
@@ -56,11 +56,33 @@ awq_ext = SyclExtension(
     py_limited_api=False,
 )
 
+# ---------------------------------------------------------------------------
+# custom_esimd_kernels_sglang.custom_esimd_kernels — ESIMD norm/gemv/qkv path
+# ---------------------------------------------------------------------------
+esimd_core_ext = SyclExtension(
+    name="custom_esimd_kernels_sglang.custom_esimd_kernels",
+    sources=[
+        "csrc/xpu/esimd_kernel.sycl",
+        "csrc/xpu/torch_extension.cc",
+    ],
+    include_dirs=[
+        root / "include",
+        root / "csrc",
+    ],
+    extra_compile_args={
+        "cxx": ["-O3", "-std=c++17"],
+        "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                 f"-I{torch_include}"],
+    },
+    extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+    py_limited_api=False,
+)
+
 setup(
     name="custom-kernels-sglang",
     version="0.1.0",
     packages=find_packages(where="python"),
     package_dir={"": "python"},
-    ext_modules=[awq_ext],
+    ext_modules=[awq_ext, esimd_core_ext],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )
