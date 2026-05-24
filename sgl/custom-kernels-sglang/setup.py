@@ -1,9 +1,20 @@
 """custom-kernels-sglang — unified SYCL/ESIMD kernel package for sglang
 on Intel PTL iGPU.
 
+Combines two formerly separate trees:
+
+  * awq_fused_xpu      In-house SYCL kernels (AWQ dequant+GEMV, MoE GEMV,
+                       dense GEMV, MoE routing, RMSNorm-gated, ESIMD MoE).
+  * custom_esimd_kernels_sglang  Selected ESIMD kernels mirrored from
+                       xiangyuT/llm-scaler's custom-esimd-kernels-vllm,
+                       trimmed to only the two extensions sglang's
+                       Qwen3.5 path actually uses (renamed from *_vllm
+                       since the upstream is now consumed by sglang).
+
 Built extensions:
   - awq_fused_xpu._C
   - custom_esimd_kernels_sglang.custom_esimd_kernels  (esimd_qkv_split_norm_rope ...)
+  - custom_esimd_kernels_sglang.eagle_ops             (page_attn_decode, chunk_gated_delta_rule_extend)
 """
 import os
 from pathlib import Path
@@ -78,11 +89,37 @@ esimd_core_ext = SyclExtension(
     py_limited_api=False,
 )
 
+# ---------------------------------------------------------------------------
+# custom_esimd_kernels_sglang.eagle_ops — page_attn_decode + GDN extend
+#
+# Carries the 5.12-5.15 graph-friendly changes from the upstream xiangyuT
+# tree:
+#   - templated on storage dtype (fp16/bf16)
+#   - optional external temp_p scratch buffer
+#   - separate K/V tensors (no merged-layout gather)
+# ---------------------------------------------------------------------------
+eagle_ext = SyclExtension(
+    name="custom_esimd_kernels_sglang.eagle_ops",
+    sources=[
+        "csrc/eagle/eagle.sycl",
+    ],
+    include_dirs=[
+        root / "csrc" / "eagle",
+    ],
+    extra_compile_args={
+        "cxx": ["-O3", "-std=c++20"],
+        "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                 f"-I{torch_include}"],
+    },
+    extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+    py_limited_api=False,
+)
+
 setup(
     name="custom-kernels-sglang",
     version="0.1.0",
     packages=find_packages(where="python"),
     package_dir={"": "python"},
-    ext_modules=[awq_ext, esimd_core_ext],
+    ext_modules=[awq_ext, esimd_core_ext, eagle_ext],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )
