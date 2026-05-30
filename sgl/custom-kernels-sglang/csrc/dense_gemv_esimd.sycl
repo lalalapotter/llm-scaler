@@ -1,0 +1,127 @@
+// ESIMD dense bf16/fp16 GEMV for batch=1 decode.
+//
+// Replaces the SYCL DenseGemvV1Spec / DenseGemvKSplitSpec for the 8 fixed
+// shapes used in Qwen3.5-35B-A3B-AWQ (modules_to_not_convert linears):
+//
+//   (K=2048, N=12288)  GDN fused QKVZBA in_proj      KS=1
+//   (K=2048, N=9216)   self_attn QKV fused           KS=1
+//   (K=4096, N=2048)   linear_attn / self_attn O     KS=1
+//   (K=2048, N=1024)   misc small in_proj            KS=1
+//   (K=512,  N=2048)   shared_expert w2              KS=1
+//   (K=2048, N=256)    MoE router gate               KS=2
+//   (K=2048, N=64)     dt_proj                       KS=4
+//   (K=2048, N=1)      shared_expert gate            KS=8
+//
+// Strategy: VL=128 (256 B per block_load — universal on PTL/BMG LSU), one
+// WG per output column, K_SPLIT threads per WG cooperate on the K reduction
+// when N alone doesn't fill the GPU.  No fp32 scratch, no cast kernel:
+//   K_SPLIT==1  → single thread writes T directly
+//   K_SPLIT> 1  → 1 SLM scalar/thread → reduce in tid==0 → write T
+
+#include "dense_gemv_esimd.h"
+#include <sycl/ext/intel/esimd.hpp>
+#include <cstdint>
+
+namespace {
+using fp16 = sycl::half;
+using bf16 = sycl::ext::oneapi::bfloat16;
+using namespace sycl::ext::intel::esimd;
+
+template <typename T, int VL, int K_SPLIT>
+struct DenseGemvEsimdKernel {
+  const T* x;     // [K]
+  const T* W;     // [N, K]
+  T*       out;   // [N]
+  int      K, N;
+
+  void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+    if constexpr (K_SPLIT > 1) {
+      slm_init<K_SPLIT * sizeof(float)>();
+    }
+
+    const int n   = static_cast<int>(item.get_group(0));
+    const int lid = static_cast<int>(item.get_local_id(0));
+    if (n >= N) return;
+
+    constexpr int kReqVL = VL;
+    const int kp = K / K_SPLIT;            // K per thread
+    const int ks = lid * kp;               // K start for this thread
+
+    const T* w_row = W + static_cast<size_t>(n) * K;
+
+    simd<float, kReqVL> acc(0.f);
+    #pragma unroll 1
+    for (int k = ks; k < ks + kp; k += kReqVL) {
+      simd<T, kReqVL> xv = block_load<T, kReqVL>(x + k);
+      simd<T, kReqVL> wv = block_load<T, kReqVL>(w_row + k);
+      acc += convert<float>(xv) * convert<float>(wv);
+    }
+    float my_sum = reduce<float>(acc, std::plus<>());
+
+    if constexpr (K_SPLIT == 1) {
+      out[n] = static_cast<T>(my_sum);
+    } else {
+      slm_block_store<float, 1>(
+          static_cast<uint32_t>(lid) * sizeof(float),
+          simd<float, 1>(my_sum));
+      barrier();
+      if (lid == 0) {
+        simd<float, K_SPLIT> parts = slm_block_load<float, K_SPLIT>(0);
+        out[n] = static_cast<T>(reduce<float>(parts, std::plus<>()));
+      }
+    }
+  }
+};
+
+template <typename T, int VL, int K_SPLIT>
+inline void submit_kernel(sycl::queue& q, const T* x, const T* W, T* out,
+                          int K, int N) {
+  sycl::range<1> global(static_cast<size_t>(N) * K_SPLIT);
+  sycl::range<1> local(K_SPLIT);
+  DenseGemvEsimdKernel<T, VL, K_SPLIT> kfn{x, W, out, K, N};
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::nd_range<1>(global, local), kfn);
+  });
+}
+
+template <typename T>
+bool dispatch(sycl::queue& q, const T* x, const T* W, T* out,
+              int K, int N) {
+  // Production shape table — matches the 8 dispatch entries in
+  // launch_dense_gemv_specialized().  All use VL=128.
+  if (K == 2048) {
+    if (N >= 1024)     { submit_kernel<T, 128, 1>(q, x, W, out, K, N); return true; }
+    if (N == 256)      { submit_kernel<T, 128, 2>(q, x, W, out, K, N); return true; }
+    if (N == 64)       { submit_kernel<T, 128, 4>(q, x, W, out, K, N); return true; }
+    if (N == 1)        { submit_kernel<T, 128, 8>(q, x, W, out, K, N); return true; }
+  } else if (K == 4096 && N == 2048) {
+    submit_kernel<T, 128, 1>(q, x, W, out, K, N); return true;
+  } else if (K == 512 && N == 2048) {
+    submit_kernel<T, 128, 1>(q, x, W, out, K, N); return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool launch_dense_gemv_esimd_bf16(
+    sycl::queue& q,
+    const c10::BFloat16* x, const c10::BFloat16* W, c10::BFloat16* out,
+    int K, int N) {
+  return dispatch<bf16>(q,
+                        reinterpret_cast<const bf16*>(x),
+                        reinterpret_cast<const bf16*>(W),
+                        reinterpret_cast<bf16*>(out),
+                        K, N);
+}
+
+bool launch_dense_gemv_esimd_fp16(
+    sycl::queue& q,
+    const c10::Half* x, const c10::Half* W, c10::Half* out,
+    int K, int N) {
+  return dispatch<fp16>(q,
+                        reinterpret_cast<const fp16*>(x),
+                        reinterpret_cast<const fp16*>(W),
+                        reinterpret_cast<fp16*>(out),
+                        K, N);
+}

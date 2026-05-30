@@ -50,6 +50,7 @@ awq_sources = [
     "csrc/awq_moe_esimd.sycl",
     "csrc/awq_moe_esimd_npacked.sycl",
     "csrc/dense_gemv.sycl",
+    "csrc/dense_gemv_esimd.sycl",
     "csrc/moe_route_topk.sycl",
     "csrc/rmsnorm_gated.sycl",
 ]

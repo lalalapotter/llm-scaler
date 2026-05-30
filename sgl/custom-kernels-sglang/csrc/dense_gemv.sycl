@@ -31,6 +31,8 @@
 #include <sycl/sycl.hpp>
 #include <cstdint>
 
+#include "dense_gemv_esimd.h"
+
 namespace {
 
 constexpr int kSgSize = 16;
@@ -335,11 +337,35 @@ bool launch_dense_gemv_specialized(
   return false;
 }
 
+// Forward to the ESIMD-typed entry; returns false for unsupported dtypes
+// (which currently can't happen because the caller already filters bf16/fp16).
+template <typename T>
+inline bool try_launch_esimd(sycl::queue& q, const T* x, const T* W, T* out,
+                             int K, int N);
+
+template <>
+inline bool try_launch_esimd<c10::BFloat16>(
+    sycl::queue& q, const c10::BFloat16* x, const c10::BFloat16* W,
+    c10::BFloat16* out, int K, int N) {
+  return launch_dense_gemv_esimd_bf16(q, x, W, out, K, N);
+}
+
+template <>
+inline bool try_launch_esimd<c10::Half>(
+    sycl::queue& q, const c10::Half* x, const c10::Half* W,
+    c10::Half* out, int K, int N) {
+  return launch_dense_gemv_esimd_fp16(q, x, W, out, K, N);
+}
+
 template <typename T>
 void launch_dense_gemv(
     sycl::queue& q,
     const T* x, const T* W, T* out,
     int M, int K, int N, at::Tensor& workspace_fp32_out) {
+  // Fast path: ESIMD specializations cover the 8 production shapes.
+  if (M == 1 && try_launch_esimd<T>(q, x, W, out, K, N)) {
+    return;
+  }
   if (launch_dense_gemv_specialized<T>(q, x, W, out, M, K, N, workspace_fp32_out)) {
     return;
   }
