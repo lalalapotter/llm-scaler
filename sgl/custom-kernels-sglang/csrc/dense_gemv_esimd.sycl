@@ -3,20 +3,26 @@
 // Replaces the SYCL DenseGemvV1Spec / DenseGemvKSplitSpec for the 8 fixed
 // shapes used in Qwen3.5-35B-A3B-AWQ (modules_to_not_convert linears):
 //
-//   (K=2048, N=12288)  GDN fused QKVZBA in_proj      KS=1
-//   (K=2048, N=9216)   self_attn QKV fused           KS=1
-//   (K=4096, N=2048)   linear_attn / self_attn O     KS=1
-//   (K=2048, N=1024)   misc small in_proj            KS=1
-//   (K=512,  N=2048)   shared_expert w2              KS=1
-//   (K=2048, N=256)    MoE router gate               KS=2
-//   (K=2048, N=64)     dt_proj                       KS=4
-//   (K=2048, N=1)      shared_expert gate            KS=8
+//   (K=2048, N=12288)  GDN fused QKVZBA in_proj      KS=1   ESIMD
+//   (K=2048, N=9216)   self_attn QKV fused           KS=1   ESIMD
+//   (K=4096, N=2048)   linear_attn / self_attn O     KS=1   ESIMD
+//   (K=2048, N=1024)   misc small in_proj            KS=1   ESIMD
+//   (K=512,  N=2048)   shared_expert w2              KS=1   ESIMD
+//   (K=2048, N=256)    MoE router gate               KS=2   ESIMD K-split
+//   (K=2048, N=64)     dt_proj                       KS=4   ESIMD K-split
+//   (K=2048, N=1)      shared_expert gate            KS=8   SYCL fallback
 //
-// Strategy: VL=128 (256 B per block_load — universal on PTL/BMG LSU), one
-// WG per output column, K_SPLIT threads per WG cooperate on the K reduction
-// when N alone doesn't fill the GPU.  No fp32 scratch, no cast kernel:
-//   K_SPLIT==1  → single thread writes T directly
-//   K_SPLIT> 1  → 1 SLM scalar/thread → reduce in tid==0 → write T
+// Strategy:
+//   * K_SPLIT == 1 path
+//       VL=128 (256 B per block_load — universal on PTL/BMG LSU), one
+//       thread emits kBlockN contiguous outputs via a single block_store.
+//       No SLM, no fp32 scratch — SYCL Graph capture works.
+//   * K_SPLIT > 1 path (small N)
+//       N alone gives too few threads to fill the EUs, so we shard the K
+//       reduction across K_SPLIT threads per output. Each thread writes
+//       its kBlockN partials into fp32 scratch [K_SPLIT, N]; a tiny
+//       trailing kernel sums the K_SPLIT rows and casts back to T.
+//       Still no SLM — graph-safe.
 
 #include "dense_gemv_esimd.h"
 #include <sycl/ext/intel/esimd.hpp>
@@ -27,78 +33,158 @@ using fp16 = sycl::half;
 using bf16 = sycl::ext::oneapi::bfloat16;
 using namespace sycl::ext::intel::esimd;
 
-template <typename T, int VL, int K_SPLIT>
+// Each thread emits kBlockN contiguous outputs via a single block_store, so
+// we never touch ESIMD scratch / work-group SLM — SYCL Graph capture works.
+// x is shared across all kBlockN W-rows so x's BW bill amortizes ×kBlockN.
+template <typename T, int VL, int kBlockN>
 struct DenseGemvEsimdKernel {
   const T* x;     // [K]
   const T* W;     // [N, K]
   T*       out;   // [N]
   int      K, N;
 
-  void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-    if constexpr (K_SPLIT > 1) {
-      slm_init<K_SPLIT * sizeof(float)>();
-    }
-
-    const int n   = static_cast<int>(item.get_group(0));
-    const int lid = static_cast<int>(item.get_local_id(0));
-    if (n >= N) return;
+  void operator()(sycl::id<1> id) const SYCL_ESIMD_KERNEL {
+    const int n_start = static_cast<int>(id[0]) * kBlockN;
+    if (n_start >= N) return;
 
     constexpr int kReqVL = VL;
-    const int kp = K / K_SPLIT;            // K per thread
-    const int ks = lid * kp;               // K start for this thread
+    simd<float, kBlockN> acc(0.f);
+    const T* w_base = W + static_cast<size_t>(n_start) * K;
 
-    const T* w_row = W + static_cast<size_t>(n) * K;
-
-    simd<float, kReqVL> acc(0.f);
     #pragma unroll 1
-    for (int k = ks; k < ks + kp; k += kReqVL) {
+    for (int k = 0; k < K; k += kReqVL) {
       simd<T, kReqVL> xv = block_load<T, kReqVL>(x + k);
-      simd<T, kReqVL> wv = block_load<T, kReqVL>(w_row + k);
-      acc += convert<float>(xv) * convert<float>(wv);
-    }
-    float my_sum = reduce<float>(acc, std::plus<>());
+      simd<float, kReqVL> xf = convert<float>(xv);
 
-    if constexpr (K_SPLIT == 1) {
-      out[n] = static_cast<T>(my_sum);
-    } else {
-      slm_block_store<float, 1>(
-          static_cast<uint32_t>(lid) * sizeof(float),
-          simd<float, 1>(my_sum));
-      barrier();
-      if (lid == 0) {
-        simd<float, K_SPLIT> parts = slm_block_load<float, K_SPLIT>(0);
-        out[n] = static_cast<T>(reduce<float>(parts, std::plus<>()));
+      #pragma unroll
+      for (int j = 0; j < kBlockN; ++j) {
+        simd<T, kReqVL> wv = block_load<T, kReqVL>(w_base + j * K + k);
+        acc[j] += reduce<float>(xf * convert<float>(wv), std::plus<>());
       }
     }
+
+    block_store<T, kBlockN>(out + n_start, convert<T>(acc));
   }
 };
 
-template <typename T, int VL, int K_SPLIT>
+template <typename T, int VL, int kBlockN>
 inline void submit_kernel(sycl::queue& q, const T* x, const T* W, T* out,
                           int K, int N) {
-  sycl::range<1> global(static_cast<size_t>(N) * K_SPLIT);
-  sycl::range<1> local(K_SPLIT);
-  DenseGemvEsimdKernel<T, VL, K_SPLIT> kfn{x, W, out, K, N};
+  sycl::range<1> global(static_cast<size_t>(N / kBlockN));
+  DenseGemvEsimdKernel<T, VL, kBlockN> kfn{x, W, out, K, N};
   q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(sycl::nd_range<1>(global, local), kfn);
+    // 1D parallel_for, no SLM / work-group scratch — SYCL-Graph safe.
+    cgh.parallel_for(global, kfn);
+  });
+}
+
+// K-split variant: each thread reduces only K/kKSplit elements and writes
+// kBlockN fp32 partials into scratch[ksplit_id, n_start..n_start+kBlockN].
+// kBlockN must divide N and kKSplit threads cover the full K. Grid is 1D
+// of size (N/kBlockN) * kKSplit, packed as ksplit_id * (N/kBlockN) + n_id.
+template <typename T, int VL, int kBlockN, int kKSplit>
+struct DenseGemvEsimdKSplit {
+  const T* x;          // [K]
+  const T* W;           // [N, K]
+  float*   scratch;    // [kKSplit, N]   fp32, NOT pre-zeroed
+  int      K, N;
+
+  void operator()(sycl::id<1> id) const SYCL_ESIMD_KERNEL {
+    const int linear_id = static_cast<int>(id[0]);
+    const int n_threads = N / kBlockN;
+    const int ksplit_id = linear_id / n_threads;
+    const int n_id      = linear_id - ksplit_id * n_threads;
+    const int n_start   = n_id * kBlockN;
+    if (ksplit_id >= kKSplit || n_start >= N) return;
+
+    constexpr int kReqVL = VL;
+    const int K_per_split = K / kKSplit;
+    const int k_start = ksplit_id * K_per_split;
+    const int k_end   = k_start + K_per_split;
+
+    simd<float, kBlockN> acc(0.f);
+    const T* w_base = W + static_cast<size_t>(n_start) * K;
+
+    #pragma unroll 1
+    for (int k = k_start; k < k_end; k += kReqVL) {
+      simd<T, kReqVL> xv = block_load<T, kReqVL>(x + k);
+      simd<float, kReqVL> xf = convert<float>(xv);
+
+      #pragma unroll
+      for (int j = 0; j < kBlockN; ++j) {
+        simd<T, kReqVL> wv = block_load<T, kReqVL>(w_base + j * K + k);
+        acc[j] += reduce<float>(xf * convert<float>(wv), std::plus<>());
+      }
+    }
+
+    block_store<float, kBlockN>(scratch + ksplit_id * N + n_start, acc);
+  }
+};
+
+// Trailing kernel: sums kKSplit fp32 partials per output and casts to T.
+// One thread per kBlockN outputs. ESIMD because the partial vector is
+// already fp32 and the cast back to bf16/fp16 vectorizes nicely.
+template <typename T, int kBlockN, int kKSplit>
+struct DenseGemvKSplitReduce {
+  const float* scratch;   // [kKSplit, N]
+  T*           out;        // [N]
+  int          N;
+
+  void operator()(sycl::id<1> id) const SYCL_ESIMD_KERNEL {
+    const int n_start = static_cast<int>(id[0]) * kBlockN;
+    if (n_start >= N) return;
+
+    simd<float, kBlockN> acc = block_load<float, kBlockN>(scratch + n_start);
+    #pragma unroll
+    for (int s = 1; s < kKSplit; ++s) {
+      simd<float, kBlockN> p = block_load<float, kBlockN>(scratch + s * N + n_start);
+      acc += p;
+    }
+    block_store<T, kBlockN>(out + n_start, convert<T>(acc));
+  }
+};
+
+template <typename T, int VL, int kBlockN, int kKSplit>
+inline void submit_ksplit(sycl::queue& q,
+                           const T* x, const T* W, T* out,
+                           int K, int N, at::Tensor& scratch_fp32) {
+  // Allocate / reshape scratch [kKSplit, N] fp32. Caller's tensor is the
+  // owning handle so it stays alive until both kernels complete.
+  auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kXPU);
+  scratch_fp32 = at::empty({kKSplit, N}, opts);
+  float* scratch = scratch_fp32.data_ptr<float>();
+
+  sycl::range<1> global_ks(static_cast<size_t>((N / kBlockN) * kKSplit));
+  DenseGemvEsimdKSplit<T, VL, kBlockN, kKSplit> kfn{x, W, scratch, K, N};
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(global_ks, kfn);
+  });
+
+  sycl::range<1> global_red(static_cast<size_t>(N / kBlockN));
+  DenseGemvKSplitReduce<T, kBlockN, kKSplit> rfn{scratch, out, N};
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(global_red, rfn);
   });
 }
 
 template <typename T>
 bool dispatch(sycl::queue& q, const T* x, const T* W, T* out,
-              int K, int N) {
-  // Production shape table — matches the 8 dispatch entries in
-  // launch_dense_gemv_specialized().  All use VL=128.
-  if (K == 2048) {
-    if (N >= 1024)     { submit_kernel<T, 128, 1>(q, x, W, out, K, N); return true; }
-    if (N == 256)      { submit_kernel<T, 128, 2>(q, x, W, out, K, N); return true; }
-    if (N == 64)       { submit_kernel<T, 128, 4>(q, x, W, out, K, N); return true; }
-    if (N == 1)        { submit_kernel<T, 128, 8>(q, x, W, out, K, N); return true; }
-  } else if (K == 4096 && N == 2048) {
-    submit_kernel<T, 128, 1>(q, x, W, out, K, N); return true;
-  } else if (K == 512 && N == 2048) {
-    submit_kernel<T, 128, 1>(q, x, W, out, K, N); return true;
-  }
+              int K, int N, at::Tensor& scratch_fp32) {
+  // Production shape table — covers the 7 hot shapes from
+  // launch_dense_gemv_specialized(); the 8th (K=2048,N=1) is too small for
+  // ESIMD's kBlockN=4 minimum and stays on the SYCL fallback at <0.1% of
+  // decode time.
+  //
+  // All paths use VL=128 and kBlockN ∈ {4, 8} so a single block_store
+  // emits the per-thread partials. None of them touches SLM / ESIMD
+  // scratch — SYCL Graph capture works on every path.
+  constexpr int VL = 128;
+  if (K == 2048 && N >= 1024 && (N % 8 == 0)) { submit_kernel<T, VL, 8>(q, x, W, out, K, N); return true; }
+  if (K == 4096 && N == 2048)                 { submit_kernel<T, VL, 8>(q, x, W, out, K, N); return true; }
+  if (K ==  512 && N == 2048)                 { submit_kernel<T, VL, 8>(q, x, W, out, K, N); return true; }
+  // Small-N K-split shapes. K=2048 splits cleanly by 2 and 4.
+  if (K == 2048 && N == 256) { submit_ksplit<T, VL, 8, 2>(q, x, W, out, K, N, scratch_fp32); return true; }
+  if (K == 2048 && N ==  64) { submit_ksplit<T, VL, 4, 4>(q, x, W, out, K, N, scratch_fp32); return true; }
   return false;
 }
 
@@ -107,21 +193,21 @@ bool dispatch(sycl::queue& q, const T* x, const T* W, T* out,
 bool launch_dense_gemv_esimd_bf16(
     sycl::queue& q,
     const c10::BFloat16* x, const c10::BFloat16* W, c10::BFloat16* out,
-    int K, int N) {
+    int K, int N, at::Tensor& scratch_fp32) {
   return dispatch<bf16>(q,
                         reinterpret_cast<const bf16*>(x),
                         reinterpret_cast<const bf16*>(W),
                         reinterpret_cast<bf16*>(out),
-                        K, N);
+                        K, N, scratch_fp32);
 }
 
 bool launch_dense_gemv_esimd_fp16(
     sycl::queue& q,
     const c10::Half* x, const c10::Half* W, c10::Half* out,
-    int K, int N) {
+    int K, int N, at::Tensor& scratch_fp32) {
   return dispatch<fp16>(q,
                         reinterpret_cast<const fp16*>(x),
                         reinterpret_cast<const fp16*>(W),
                         reinterpret_cast<fp16*>(out),
-                        K, N);
+                        K, N, scratch_fp32);
 }

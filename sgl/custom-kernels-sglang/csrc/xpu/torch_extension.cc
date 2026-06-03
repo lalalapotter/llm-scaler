@@ -102,6 +102,17 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
   m.def("esimd_fused_add_rms_norm_batched(Tensor hidden_states, Tensor residual, "
         "Tensor weight, float eps) -> Tensor");
   m.impl("esimd_fused_add_rms_norm_batched", torch::kXPU, &esimd_fused_add_rms_norm_batched);
+
+  // Fused Conv1d + GDN for SEQUENTIAL qkvz layout (Qwen3.5-35B-A3B and similar).
+  // Supports fp16 and bf16; dispatch by qkvz.dtype.
+  m.def("esimd_gdn_conv_fused_seq(Tensor qkvz, "
+        "Tensor(a!) conv_state, Tensor conv_weight, Tensor conv_bias, "
+        "Tensor conv_state_indices, "
+        "Tensor A_log, Tensor dt_bias, Tensor ba, "
+        "Tensor(b!) ssm_state, Tensor ssm_state_indices, "
+        "Tensor(c!) output, Tensor(d!) z_out, "
+        "int N, int H, int HV, int K, int V, float scale) -> Tensor");
+  m.impl("esimd_gdn_conv_fused_seq", torch::kXPU, &esimd_gdn_conv_fused_seq);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels() {

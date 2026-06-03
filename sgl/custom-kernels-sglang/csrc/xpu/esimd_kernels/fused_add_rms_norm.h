@@ -6,15 +6,18 @@
  * Single WG, 1 thread. K=2048 → 4 iterations with VL=512.
  * Two-pass: pass 1 = add + sum_sq; pass 2 = normalize + write output.
  * Residual updated in-place.
+ *
+ * Templated on activation dtype T ∈ {fp16, bf16}. Internal accumulation is fp32.
  */
 
 #pragma once
 #include "utils.h"
 
+template <typename T>
 struct FusedAddRmsNorm_kernel {
-    fp16*       hidden_ptr;    // [1, K] — input, also used as output
-    fp16*       residual_ptr;  // [1, K] — updated in-place
-    const fp16* weight_ptr;    // [K] — Gemma norm weight (w+1.0)
+    T*       hidden_ptr;    // [1, K] — input, also used as output
+    T*       residual_ptr;  // [1, K] — updated in-place
+    const T* weight_ptr;    // [K] — Gemma norm weight (w+1.0)
     int K;
     float eps;
 
@@ -26,12 +29,12 @@ struct FusedAddRmsNorm_kernel {
         float sum_sq = 0.0f;
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + offset);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
+            simd<float, VL> h = block_load<T, VL>(hidden_ptr + offset);
+            simd<float, VL> r = block_load<T, VL>(residual_ptr + offset);
             simd<float, VL> added = h + r;
 
             // Write residual in-place
-            block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
+            block_store<T, VL>(residual_ptr + offset, simd<T, VL>(added));
 
             simd<float, VL> sq = added * added;
             sq.select<256,1>(0) += sq.select<256,1>(256);
@@ -51,21 +54,30 @@ struct FusedAddRmsNorm_kernel {
         // Pass 2: normalize and write output (reuse hidden_ptr as output)
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
-            simd<float, VL> w = block_load<fp16, VL>(weight_ptr + offset);
+            simd<float, VL> r = block_load<T, VL>(residual_ptr + offset);
+            simd<float, VL> w = block_load<T, VL>(weight_ptr + offset);
             simd<float, VL> normed = r * inv_rms * w;
-            block_store<fp16, VL>(hidden_ptr + offset, simd<fp16, VL>(normed));
+            block_store<T, VL>(hidden_ptr + offset, simd<T, VL>(normed));
         }
     }
 };
 
-inline void fused_add_rms_norm_host(
-    fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
+template <typename T>
+inline void fused_add_rms_norm_host_t(
+    T* hidden_ptr, T* residual_ptr, const T* weight_ptr,
     int K, float eps, sycl::queue& q)
 {
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(1, 1),
-            FusedAddRmsNorm_kernel{hidden_ptr, residual_ptr, weight_ptr, K, eps});
+            FusedAddRmsNorm_kernel<T>{hidden_ptr, residual_ptr, weight_ptr, K, eps});
     });
+}
+
+// Backward-compat fp16 entry point (existing callers).
+inline void fused_add_rms_norm_host(
+    fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
+    int K, float eps, sycl::queue& q)
+{
+    fused_add_rms_norm_host_t<fp16>(hidden_ptr, residual_ptr, weight_ptr, K, eps, q);
 }
