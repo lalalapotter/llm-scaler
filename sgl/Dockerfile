@@ -15,21 +15,31 @@ ENV MAX_JOBS=1
 WORKDIR /llm-scaler/sgl
 COPY . .
 
+# --- System packages + pip base setup ---
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3-pip python3-dev git \
  && python3 -m pip config set global.break-system-packages true \
  && pip3 install ninja \
  && pip3 install torch==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu \
- && git clone --depth 1 -b dev-bmg https://github.com/analytics-zoo/sgl-kernel-xpu.git /root/sk \
+ && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
+
+# --- Build sgl-kernel-xpu wheel ---
+RUN git clone --depth 1 -b dev-bmg https://github.com/analytics-zoo/sgl-kernel-xpu.git /root/sk \
  && pip3 wheel -v /root/sk --config-settings=cmake.define.DPCPP_SYCL_TARGET=${DPCPP_SYCL_TARGET} --wheel-dir /root/wheels --no-deps \
  && rm -rf /root/sk \
- && git clone --depth 1 -b dev-bmg https://github.com/analytics-zoo/sglang.git /root/sglang \
+ && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
+
+# --- Build sglang wheel ---
+RUN git clone --depth 1 -b dev-bmg https://github.com/analytics-zoo/sglang.git /root/sglang \
  && cd /root/sglang/python \
  && cp pyproject_xpu.toml pyproject.toml \
  && sed -i '/sgl-kernel/d;/torch==/d;/torchaudio==/d;/torchvision==/d;/torchao==/d' pyproject.toml \
  && pip3 wheel -v . --wheel-dir /root/wheels --no-deps \
- && cd / && rm -rf /root/sglang \
- && . /opt/intel/oneapi/setvars.sh --force \
+ && rm -rf /root/sglang \
+ && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
+
+# --- Build custom ESIMD kernels ---
+RUN . /opt/intel/oneapi/setvars.sh --force \
  && cd /llm-scaler/sgl/custom-esimd-kernels \
  && CXX=icpx pip3 wheel -v . --wheel-dir /root/wheels --no-deps --no-build-isolation \
  && cd /llm-scaler/sgl/custom-esimd-kernels-sglang \
