@@ -1,5 +1,7 @@
 # ======== Build Stage ========
-FROM intel/omix:latest-devel-ubuntu24.04 AS builder
+# Change 1: latest -> 0.2.0
+# IMPORTANT: 0.2.0 doesn't exist on 001, but its exactly the same as the current latest (same digest)
+FROM intel/omix:0.2.0-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ARG http_proxy
@@ -12,7 +14,11 @@ ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
 ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
 ENV MAX_JOBS=1
 
-WORKDIR /llm-scaler/sgl
+# Change 2: Replaced all /llm-scaler/sgl by /llm-scaler/sglang
+WORKDIR /llm-scaler/sglang
+
+# NOTE: to be replaced by git clones for custom-esimd-kernels and custom-esimd-kernels-sglang
+# Potentially merge the above two into the same folder?
 COPY . .
 
 # --- System packages + pip base setup ---
@@ -40,9 +46,9 @@ RUN git clone --depth 1 -b dev-bmg https://github.com/analytics-zoo/sglang.git /
 
 # --- Build custom ESIMD kernels ---
 RUN . /opt/intel/oneapi/setvars.sh --force \
- && cd /llm-scaler/sgl/custom-esimd-kernels \
+ && cd /llm-scaler/sglang/custom-esimd-kernels \
  && CXX=icpx pip3 wheel -v . --wheel-dir /root/wheels --no-deps --no-build-isolation \
- && cd /llm-scaler/sgl/custom-esimd-kernels-sglang \
+ && cd /llm-scaler/sglang/custom-esimd-kernels-sglang \
  && CXX=icpx pip3 wheel -v . --wheel-dir /root/wheels --no-deps --no-build-isolation \
  && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
 
@@ -59,7 +65,7 @@ ENV http_proxy=${http_proxy} https_proxy=${https_proxy} no_proxy=${no_proxy}
 ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
 ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
 
-WORKDIR /llm-scaler/sgl
+WORKDIR /llm-scaler/sglang
 COPY . .
 
 # Single RUN: install UMD driver (BMG) + all pre-built wheels via bind-mounted /root/wheels
@@ -78,7 +84,7 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && python3 -m pip config set global.break-system-packages true \
  && pip3 install /tmp/wheels/*.whl --extra-index-url https://download.pytorch.org/whl/xpu \
  && pip3 install --no-deps xgrammar==0.1.33 || true \
- && chmod +x /llm-scaler/sgl/scripts/*.sh \
+ && chmod +x /llm-scaler/sglang/scripts/*.sh \
  # --- Size cleanup: drop caches + bytecode ---
  && find /opt/venv /usr/local/lib/python3* -name "*.pyc" -delete 2>/dev/null || true \
  && find /opt/venv /usr/local/lib/python3* -name "__pycache__" -type d \
@@ -87,4 +93,4 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && rm -rf /root/.cache /root/.cmake /var/tmp/* /var/lib/apt/lists/*
 
 CMD ["bash"]
-
+# To be changed to ENTRYPOINT
