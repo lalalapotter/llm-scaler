@@ -1,86 +1,67 @@
 #!/usr/bin/env bash
-# Launch SGLang server for Qwen3.6-35B-A3B online fp8 on Intel BMG, TP=2.
+# Launch SGLang for Qwen3.6-35B-A3B, online fp8 (e5m2), on Intel BMG at TP=2.
 #
-# e5m2 online-fp8 + full-ESIMD config, XPU-graph DISABLED (accuracy).
-# All ESIMD fast-paths + prefill fast-paths + e5m2 fused decode kernels enabled.
-# Required env knobs are documented inline.
+# Weights are quantized on the fly to fp8-e5m2 and the full ESIMD decode/prefill
+# fast-path set is enabled. XPU graph is off (accuracy); the fused decode
+# kernels below recover the host-dispatch cost that a graph would have hidden.
+#
+# Usage (inside the container):
+#   scripts/start_qwen3_6_service.sh
+#   MODEL_PATH=/models/Qwen3.6-35B-A3B PORT=30000 scripts/start_qwen3_6_service.sh
+#
+# See scripts/qwen3_6_common.sh for the shared device/mamba/ESIMD settings and
+# for the full list of overridable variables.
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./qwen3_6_common.sh
+source "${SCRIPT_DIR}/qwen3_6_common.sh"
+
 MODEL_PATH="${MODEL_PATH:-/models/Qwen3.6-35B-A3B}"
-HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-30000}"
-TP_SIZE="${TP_SIZE:-2}"
+# Static memory pool (weights + KV). Lower this if the cards are shared with
+# another tenant, or if the KV pool needs to grow for longer contexts.
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.9}"
 
-# --- device selection ---
-# Pin to the last two BMG cards (physical 0,1). After masking, sglang sees
-# them as XPU 0,1 so TP=2 maps onto exactly these two devices.
-export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-0,1}"
+# --- online fp8 dtype ---------------------------------------------------
+# The fused MoE-full decode kernel and the fp8 MoE router path below are
+# implemented for e5m2 only; they silently fall back on e4m3.
+export SGLANG_FP8_DTYPE="${SGLANG_FP8_DTYPE:-e5m2}"
 
-# --- triton-xpu fp16 mismatch workaround ---
-# Mamba state pool defaults to bf16; force fp16 so it matches the activation
-# dtype when running --dtype float16 (otherwise causal_conv1d_update kernel
-# fails with "Mismatched type for col0 (bf16 vs fp16)").
-export SGLANG_MAMBA_CONV_DTYPE=float16
-export SGLANG_MAMBA_SSM_DTYPE=float16
+# --- fp8-only ESIMD fast-paths ------------------------------------------
+# These read fp8 weight/scale layouts, so they only fire on this path. The
+# GGUF service enables its own SGL_XPU_GGUF_* equivalents instead.
 
-# --- ESIMD fast-path gates ---
-# All ESIMD/XPU fast-path gates use the SGL_XPU_* prefix.
-# decode attn split-K (sglang_decode_attn): mandatory for online perf
-export SGL_XPU_ESIMD_DECODE=1
-# MoE silu routed kernel (replaces triton fused_moe on XPU)
-export SGL_XPU_ESIMD_MOE=1
+# FP8 MoE silu routed kernel (replaces the triton fused_moe on XPU).
+export SGL_XPU_ESIMD_MOE="${SGL_XPU_ESIMD_MOE:-1}"
 # Full decode MoE fusion: router topk + routed + shared + gate -> 1 dispatch.
-# e5m2 only (SGLANG_FP8_DTYPE=e5m2 below). Reads native N-major w13 (no
-# transposed weight copy). This is the main decode TPOT lever for this model.
-export SGL_XPU_ESIMD_MOE_FULL=1
-# MoE prefill ESIMD (M-tiled DPAS fp8 MoE prefill)
-export SGL_XPU_ESIMD_MOE_PREFILL=1
-# Full-attention fused QKV split + RMSNorm + RoPE (Qwen3.5/3.6)
-export SGL_XPU_FA_ESIMD_QKV=1
-# GDN conv fused_seq for the linear-attention decode path
-export SGL_XPU_GDN_ESIMD=1
-# GDN chunk_gated_delta_rule prefill (extend) — ESIMD M-tiled kernel.
-# This is the prefill TTFT lever: triton GDN recurrence is the prefill
-# bottleneck. The kernel was extended to accept fp16 ssm-state to match
-# this fp16 model's mamba pool.
-export SGL_XPU_GDN_EXTEND_ESIMD=1
-# Prefill SDPA via DPAS/XMX (AOT-compiled, doubleGRF)
-export SGL_XPU_PREFILL_DPAS=1
-
-# --- XPU Graph (CUDA-graph-equivalent) ---
-# DISABLED: xpu-graph accuracy is unstable on this model, so decode runs eager.
-# The e5m2 MoE-full fusion + resadd-norm fusions below recover the per-step
-# host-dispatch cost that the graph would otherwise have hidden.
-export SGL_XPU_ENABLE_GRAPH=0
-
-# --- e5m2 online-quant + fused decode kernels ---
-# Quantize online fp8 to e5m2 (the fused MoE-full decode kernels require e5m2).
-export SGLANG_FP8_DTYPE=e5m2
+# Reads the native N-major w13 directly, so it needs no transposed weight copy
+# and no extra device memory. This is the main decode TPOT lever.
+export SGL_XPU_ESIMD_MOE_FULL="${SGL_XPU_ESIMD_MOE_FULL:-1}"
+# FP8 MoE prefill (M-tiled DPAS).
+export SGL_XPU_ESIMD_MOE_PREFILL="${SGL_XPU_ESIMD_MOE_PREFILL:-1}"
 # GDN gated-RMSNorm as an ESIMD GEMV (decode).
-export SGL_XPU_GDN_NORM_GEMV=1
-# Superseded by GDN_RESADD_NORM (which fuses in_proj qkvz+ba WITH input_layernorm);
-# the standalone in_proj fused2 gave no e2e gain -> keep OFF.
-export SGL_XPU_GDN_INPROJ_FUSED2=0
-# Fuse input_layernorm (resadd+rmsnorm) + GDN in_proj (qkvz+ba) into one ESIMD GEMV.
-export SGL_XPU_GDN_RESADD_NORM=1
+export SGL_XPU_GDN_NORM_GEMV="${SGL_XPU_GDN_NORM_GEMV:-1}"
+# Fuse GDN input_layernorm (resadd+rmsnorm) + in_proj (qkvz+ba) into one GEMV.
+export SGL_XPU_GDN_RESADD_NORM="${SGL_XPU_GDN_RESADD_NORM:-1}"
 # Fuse full-attention input_layernorm (resadd+rmsnorm) into qkv_proj (decode).
-export SGL_XPU_FA_RESADD_NORM=1
-# MoE router as fp8 ESIMD GEMV instead of fp16 aten::mm (saves a host launch per
-# MoE layer). Perturbs top-8 routing on a fraction of tokens -> gsm8k A/B before
-# trusting; set to 0 to fall back to the accurate fp16 gate.
-export SGL_XPU_MOE_ROUTER_FP8=1
-# Skip the per-step TP token-count sync (host overhead) on this single-node TP setup.
-export SGLANG_XPU_TP_SYNC_TOKENS=0
+export SGL_XPU_FA_RESADD_NORM="${SGL_XPU_FA_RESADD_NORM:-1}"
+# Superseded by SGL_XPU_GDN_RESADD_NORM, which fuses in_proj qkvz+ba together
+# WITH input_layernorm and is strictly more fused. The standalone in_proj
+# fusion caught only a couple of fallback cases per step and gave no e2e gain,
+# so it stays OFF.
+export SGL_XPU_GDN_INPROJ_FUSED2="${SGL_XPU_GDN_INPROJ_FUSED2:-0}"
+# MoE router as an fp8 ESIMD GEMV instead of an fp16 aten::mm, saving one host
+# launch per MoE layer. Quantizing the gate perturbs top-8 routing on a small
+# fraction of tokens -- A/B with run_gsm8k.py before trusting it, and set to 0
+# to fall back to the accurate fp16 gate.
+export SGL_XPU_MOE_ROUTER_FP8="${SGL_XPU_MOE_ROUTER_FP8:-1}"
 
 # --load-format layered_fp8: build on CPU, load the full bf16 checkpoint into
-# host RAM, then move + quantize each module onto the device one at a time.
-# Peak device memory is fp8 weights + one module's bf16, so a TP=2 split
-# (only two cards) fits where the default loader would OOM on the full bf16.
-# --mamba-scheduler-strategy extra_buffer + --page-size 64: hybrid GDN
-# scheduler tuning that keeps the radix prefix-cache stable on this model
-# (so radix cache is left ENABLED for prefill reuse).
+# host RAM, then move + quantize one module at a time onto the device. Peak
+# device memory is the fp8 weights plus a single module's bf16, so a TP=2 split
+# across two cards fits where the default loader would OOM on the full bf16.
+# shellcheck disable=SC2086
 exec python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --tp "${TP_SIZE}" \
@@ -90,11 +71,13 @@ exec python3 -m sglang.launch_server \
     --attention-backend intel_xpu \
     --trust-remote-code \
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \
-    --max-mamba-cache-size 64 \
-    --page-size 64 \
+    --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}" \
+    --page-size "${PAGE_SIZE}" \
     --mamba-scheduler-strategy extra_buffer \
     --reasoning-parser qwen3 \
+    --tool-call-parser "${TOOL_CALL_PARSER}" \
     --enable-cache-report \
     --enable-metrics \
     --host "${HOST}" \
-    --port "${PORT}"
+    --port "${PORT}" \
+    ${EXTRA_ARGS}
