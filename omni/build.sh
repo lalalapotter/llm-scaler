@@ -1,22 +1,134 @@
+#!/usr/bin/env bash
+
 set -euo pipefail
 
 HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-}}"
 HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY}}}"
-export HTTP_PROXY HTTPS_PROXY
+NO_PROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"
+export HTTP_PROXY HTTPS_PROXY NO_PROXY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || true)"
 VERSION_FILE="${SCRIPT_DIR}/omni_xpu_kernel/omni_xpu_kernel/_version.py"
-TAG="$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' "${VERSION_FILE}")"
+TAG="$(sed -n 's/^__image_version__ = "\([^"]*\)"$/\1/p' "${VERSION_FILE}")"
 if [ -z "${TAG}" ]; then
     echo "Unable to read Omni version from ${VERSION_FILE}" >&2
     exit 1
 fi
 
-cd "${SCRIPT_DIR}"
-set -x
+DETECTED_SOURCE_REVISION=unknown
+DETECTED_SOURCE_DIRTY=unknown
+if [ -n "${REPOSITORY_ROOT}" ]; then
+    DETECTED_SOURCE_REVISION="$(git -C "${REPOSITORY_ROOT}" rev-parse HEAD)"
+    if [ -n "$(git -C "${REPOSITORY_ROOT}" status --porcelain --untracked-files=normal -- omni)" ]; then
+        DETECTED_SOURCE_DIRTY=true
+    else
+        DETECTED_SOURCE_DIRTY=false
+    fi
+fi
+SOURCE_REVISION="${OMNI_SOURCE_REVISION:-${DETECTED_SOURCE_REVISION}}"
+SOURCE_DIRTY="${OMNI_SOURCE_DIRTY:-${DETECTED_SOURCE_DIRTY}}"
 
-DOCKER_BUILDKIT=1 docker build -f ./docker/Dockerfile . \
-    -t "intel/llm-scaler-omni:${TAG}" \
-    --build-arg "IMAGE_TAG=${TAG}" \
-    --build-arg "https_proxy=${HTTPS_PROXY}" \
+# XPU_TARGET is the canonical Docker build parameter. Keep OMNI_XPU_DEVICE as
+# a backwards-compatible user-facing alias used by existing kernel scripts.
+DEVICE_TARGET="${XPU_TARGET:-${OMNI_XPU_DEVICE:-bmg}}"
+case "${DEVICE_TARGET}" in
+    bmg|ptl-h) ;;
+    *)
+        echo "Unsupported XPU target '${DEVICE_TARGET}'; use bmg or ptl-h" >&2
+        exit 1
+        ;;
+esac
+
+BASE_IMAGE="${OMNI_BASE_IMAGE:-intel/omix:0.3.0-devel-ubuntu24.04@sha256:53e2c4503beeea4aff906dea180933be672449bcf04eb38df3d89622a1cd0967}"
+TORCH_VERSION="${OMNI_TORCH_VERSION:-2.13.0+xpu}"
+TORCHVISION_VERSION="${OMNI_TORCHVISION_VERSION:-0.28.0+xpu}"
+TORCHAUDIO_VERSION="${OMNI_TORCHAUDIO_VERSION:-2.11.0+xpu}"
+ONEDNN_VERSION="${OMNI_ONEDNN_VERSION:-2026.0.0}"
+ONEDNN_SOURCE_REPOSITORY="${OMNI_ONEDNN_SOURCE_REPOSITORY:-https://github.com/uxlfoundation/oneDNN.git}"
+ONEDNN_SOURCE_COMMIT="${OMNI_ONEDNN_SOURCE_COMMIT:-03c022d3ffdcee958cfacbe720048e725fdf644c}"
+ONEDNN_PATCH_SHA256="${OMNI_ONEDNN_PATCH_SHA256:-0a7afff4134f115b4bc53f46301ca3d62b1c11dc02e32c64635c469769fcdaeb}"
+BUILD_MAX_JOBS="${MAX_JOBS:-8}"
+IMAGE_REPOSITORY="${OMNI_IMAGE_REPOSITORY:-intel/llm-scaler-omni}"
+COMFYUI_REPOSITORY="${COMFYUI_REPOSITORY:-https://github.com/Comfy-Org/ComfyUI.git}"
+COMFYUI_COMMIT="${COMFYUI_COMMIT:-7a131a3afadc8200120f67f9236311a2c48b7445}"
+COMFYUI_VERSION="${COMFYUI_VERSION:-0.33.4}"
+COMFYUI_FRONTEND_VERSION="${COMFYUI_FRONTEND_VERSION:-1.49.6}"
+COMFYUI_WORKFLOW_TEMPLATES_VERSION="${COMFYUI_WORKFLOW_TEMPLATES_VERSION:-0.11.46}"
+COMFYUI_MANAGER_VERSION="${COMFYUI_MANAGER_VERSION:-4.2.2}"
+KITCHEN_REPOSITORY="${COMFY_KITCHEN_REPOSITORY:-https://github.com/xiangyuT/comfy-kitchen-xpu.git}"
+KITCHEN_COMMIT="${COMFY_KITCHEN_COMMIT:-9eccb7fa42edf14bc4a4c41aafd645ff1f1dcb75}"
+KITCHEN_VERSION="${COMFY_KITCHEN_VERSION:-0.2.31}"
+AIMDO_REPOSITORY="${COMFY_AIMDO_REPOSITORY:-https://github.com/xiangyuT/comfy-aimdo-xpu.git}"
+AIMDO_COMMIT="${COMFY_AIMDO_COMMIT:-063d66e5345fea58d1a4e8aa6f160ccc0c593f16}"
+AIMDO_VERSION="${COMFY_AIMDO_VERSION:-0.4.13}"
+GGUF_REPOSITORY="${COMFY_GGUF_REPOSITORY:-https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git}"
+GGUF_COMMIT="${COMFY_GGUF_COMMIT:-39671fe73117ba97de7011e7e06e32599dcda06d}"
+NUNCHAKU_REPOSITORY="${COMFY_NUNCHAKU_REPOSITORY:-https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git}"
+NUNCHAKU_COMMIT="${COMFY_NUNCHAKU_COMMIT:-cc0f6236b6c329178ad4ef58452a874e774c7b8e}"
+NUNCHAKU_VERSION="${COMFY_NUNCHAKU_VERSION:-1.2.1+xpu.3}"
+SOL_ATTN_REPOSITORY="${COMFY_SOL_ATTN_REPOSITORY:-https://github.com/xiangyuT/ComfyUI-SolAttn_xpu.git}"
+SOL_ATTN_COMMIT="${COMFY_SOL_ATTN_COMMIT:-5f1c4aac3ca32a00b0b4c15ddbb7cb53fa43344d}"
+SYCL_TLA_REPOSITORY="${OMNI_SYCL_TLA_REPOSITORY:-https://github.com/intel/sycl-tla.git}"
+SYCL_TLA_COMMIT="${OMNI_SYCL_TLA_COMMIT:-2fc09973bfdf15755090fcb0e3b6ad236408a992}"
+
+DOCKERFILE_PATH="${SCRIPT_DIR}/docker/Dockerfile"
+DOCKER_TARGET=runtime-comfyui
+
+if [ ! -f "${DOCKERFILE_PATH}" ]; then
+    echo "Dockerfile not found: ${DOCKERFILE_PATH}" >&2
+    exit 1
+fi
+
+IMAGE_NAME="${IMAGE_REPOSITORY}:${TAG}-comfyui-${DEVICE_TARGET}"
+
+cd "${SCRIPT_DIR}"
+
+DOCKER_ARGS=(
+    -f "${DOCKERFILE_PATH}"
+    --target "${DOCKER_TARGET}"
+    -t "${IMAGE_NAME}"
+    --build-arg "BASE_IMAGE=${BASE_IMAGE}"
+    --build-arg "TORCH_VERSION=${TORCH_VERSION}"
+    --build-arg "TORCHVISION_VERSION=${TORCHVISION_VERSION}"
+    --build-arg "TORCHAUDIO_VERSION=${TORCHAUDIO_VERSION}"
+    --build-arg "ONEDNN_VERSION=${ONEDNN_VERSION}"
+    --build-arg "ONEDNN_SOURCE_REPOSITORY=${ONEDNN_SOURCE_REPOSITORY}"
+    --build-arg "ONEDNN_SOURCE_COMMIT=${ONEDNN_SOURCE_COMMIT}"
+    --build-arg "ONEDNN_PATCH_SHA256=${ONEDNN_PATCH_SHA256}"
+    --build-arg "IMAGE_TAG=${TAG}"
+    --build-arg "XPU_TARGET=${DEVICE_TARGET}"
+    --build-arg "MAX_JOBS=${BUILD_MAX_JOBS}"
+    --build-arg "COMFYUI_REPOSITORY=${COMFYUI_REPOSITORY}"
+    --build-arg "COMFYUI_COMMIT=${COMFYUI_COMMIT}"
+    --build-arg "COMFYUI_VERSION=${COMFYUI_VERSION}"
+    --build-arg "COMFYUI_FRONTEND_VERSION=${COMFYUI_FRONTEND_VERSION}"
+    --build-arg "COMFYUI_WORKFLOW_TEMPLATES_VERSION=${COMFYUI_WORKFLOW_TEMPLATES_VERSION}"
+    --build-arg "COMFYUI_MANAGER_VERSION=${COMFYUI_MANAGER_VERSION}"
+    --build-arg "COMFY_KITCHEN_REPOSITORY=${KITCHEN_REPOSITORY}"
+    --build-arg "COMFY_KITCHEN_COMMIT=${KITCHEN_COMMIT}"
+    --build-arg "COMFY_KITCHEN_VERSION=${KITCHEN_VERSION}"
+    --build-arg "COMFY_AIMDO_REPOSITORY=${AIMDO_REPOSITORY}"
+    --build-arg "COMFY_AIMDO_COMMIT=${AIMDO_COMMIT}"
+    --build-arg "COMFY_AIMDO_VERSION=${AIMDO_VERSION}"
+    --build-arg "COMFY_GGUF_REPOSITORY=${GGUF_REPOSITORY}"
+    --build-arg "COMFY_GGUF_COMMIT=${GGUF_COMMIT}"
+    --build-arg "COMFY_NUNCHAKU_REPOSITORY=${NUNCHAKU_REPOSITORY}"
+    --build-arg "COMFY_NUNCHAKU_COMMIT=${NUNCHAKU_COMMIT}"
+    --build-arg "COMFY_NUNCHAKU_VERSION=${NUNCHAKU_VERSION}"
+    --build-arg "COMFY_SOL_ATTN_REPOSITORY=${SOL_ATTN_REPOSITORY}"
+    --build-arg "COMFY_SOL_ATTN_COMMIT=${SOL_ATTN_COMMIT}"
+    --build-arg "https_proxy=${HTTPS_PROXY}"
     --build-arg "http_proxy=${HTTP_PROXY}"
+    --build-arg "no_proxy=${NO_PROXY}"
+)
+
+DOCKER_ARGS+=(
+    --build-arg "SYCL_TLA_REPOSITORY=${SYCL_TLA_REPOSITORY}"
+    --build-arg "SYCL_TLA_COMMIT=${SYCL_TLA_COMMIT}"
+    --build-arg "LLM_SCALER_SOURCE_REVISION=${SOURCE_REVISION}"
+    --build-arg "LLM_SCALER_SOURCE_DIRTY=${SOURCE_DIRTY}"
+)
+
+set -x
+DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" .

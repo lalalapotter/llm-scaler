@@ -351,6 +351,7 @@ def esimd_qkv_split_norm_rope(
     attn_output_gate: bool,
     rotary_dim: int = 256,
     cos_sin_cache: torch.Tensor = None,
+    normalize_v: bool = False,
 ) -> torch.Tensor:
     """Fused QKV Split + RMSNorm(weight+1.0, eps=1e-6) + RoPE.
 
@@ -364,12 +365,14 @@ def esimd_qkv_split_norm_rope(
     rotary_dim:    number of dimensions to apply RoPE.
     cos_sin_cache: [max_pos, rotary_dim] fp16 — from rotary_emb.cos_sin_cache.
                    Layout: [cos(rotary_dim/2), sin(rotary_dim/2)] per row.
+    normalize_v:   apply Gemma4's weight-free RMSNorm to V.
     headDim=256 only.
     """
     return _ops.esimd_qkv_split_norm_rope(
         qkv_state, q_out, gate_out, k_out, v_out,
         norm_wq, norm_wk, positions,
-        q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
+        q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache,
+        normalize_v)
 
 
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
@@ -1087,6 +1090,56 @@ def moe_forward_full(
         top_k, num_shared_experts, n_routed_experts)
 
 
+def moe_forward_full_gelu_tanh_routed(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Gemma4 routed MoE for E4M3 or E5M2 per-expert FP8 weights."""
+    return _moe_batch.moe_forward_full_gelu_tanh_routed(
+        x,
+        topk_weights,
+        topk_indices,
+        gate_up_weight,
+        gate_up_scale,
+        down_weight,
+        down_scale,
+        top_k,
+        n_routed_experts,
+    )
+
+
+def moe_forward_full_gelu_tanh_decode(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Gemma4 TP=2 decode from router logits for E4M3 or E5M2 weights."""
+    return _moe_batch.moe_forward_full_gelu_tanh_decode(
+        x,
+        logits,
+        gate_up_weight,
+        gate_up_scale,
+        down_weight,
+        down_scale,
+        per_expert_scale,
+        top_k,
+        n_routed_experts,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MoE INT4 Batch ops
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1677,6 +1730,31 @@ def moe_prefill_full_fp8(
         w13, w13_scale, w2, w2_scale, top_k, num_experts)
 
 
+def moe_prefill_full_fp8_gelu_tanh(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    top_k: int,
+    num_experts: int,
+) -> torch.Tensor:
+    """Gemma4 M-tiled FP8 MoE prefill for E4M3 or E5M2 weights."""
+    return _moe_fp8_prefill.moe_prefill_full_fp8_gelu_tanh(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        top_k,
+        num_experts,
+    )
+
+
 # Decode SDPA for sglang's flat NHD KV-cache layout. Exposed as a pybind11
 # method on the compiled extension module (not a torch.ops op).
 def _load_attn_mod():
@@ -1707,3 +1785,193 @@ def sglang_decode_attn_temp_size(batches: int, num_q_heads: int, max_seq_len: in
     n_splits = max((max_seq_len + SPLIT_TILE - 1) // SPLIT_TILE, 1)
     per_partial = batches * num_q_heads * n_splits
     return per_partial * (1 + 1 + 256)
+
+
+def esimd_gemv_fp16(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    return _ops.esimd_gemv_fp16(input, weight, output)
+
+
+def esimd_norm_gemv_norm_fp16(
+    residual: torch.Tensor,
+    scale_with_root: torch.Tensor,
+    proj_weight: torch.Tensor,
+    pre_ff_weight: torch.Tensor,
+    router_logits: torch.Tensor,
+    moe_input: torch.Tensor,
+    eps: float,
+) -> None:
+    _ops.esimd_norm_gemv_norm_fp16(
+        residual,
+        scale_with_root,
+        proj_weight,
+        pre_ff_weight,
+        router_logits,
+        moe_input,
+        eps,
+    )
+
+
+def esimd_norm_add_norm_gemv_gelu_fp8(
+    attention_output: torch.Tensor,
+    residual_input: torch.Tensor,
+    post_attention_weight: torch.Tensor,
+    pre_feedforward_weight: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    residual_output: torch.Tensor,
+    activation_output: torch.Tensor,
+    post_attention_eps: float,
+    pre_feedforward_eps: float,
+) -> None:
+    _ops.esimd_norm_add_norm_gemv_gelu_fp8(
+        attention_output,
+        residual_input,
+        post_attention_weight,
+        pre_feedforward_weight,
+        gate_up_weight,
+        gate_up_scale,
+        residual_output,
+        activation_output,
+        post_attention_eps,
+        pre_feedforward_eps,
+    )
+
+
+def esimd_rmsnorm_gemv_fp8(
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gemv_weight: torch.Tensor,
+    gemv_scale: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+) -> None:
+    _ops.esimd_rmsnorm_gemv_fp8(
+        input,
+        norm_weight,
+        gemv_weight,
+        gemv_scale,
+        output,
+        eps,
+    )
+
+
+def esimd_dual_rmsnorm_residual_scalar(
+    x1: torch.Tensor,
+    weight1: torch.Tensor,
+    x2: torch.Tensor,
+    weight2: torch.Tensor,
+    weight3: torch.Tensor,
+    residual: torch.Tensor,
+    output: torch.Tensor,
+    eps1: float,
+    eps2: float,
+    eps3: float,
+    scalar: float,
+) -> None:
+    _ops.esimd_dual_rmsnorm_residual_scalar(
+        x1,
+        weight1,
+        x2,
+        weight2,
+        weight3,
+        residual,
+        output,
+        eps1,
+        eps2,
+        eps3,
+        scalar,
+    )
+
+
+def xpu_create_kv_indices(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    page_kernel_lens: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_start_idx: torch.Tensor | None,
+    kv_indices: torch.Tensor,
+    max_len: int,
+) -> None:
+    start = page_kernel_lens if kv_start_idx is None else kv_start_idx
+    _ops.xpu_create_kv_indices(
+        req_to_token,
+        req_pool_indices,
+        page_kernel_lens,
+        kv_indptr,
+        start,
+        kv_indices,
+        max_len,
+        kv_start_idx is not None,
+    )
+
+
+def esimd_norm_add_norm(
+    h2_raw: torch.Tensor,
+    h1: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    out: torch.Tensor,
+    eps1: float,
+    eps2: float,
+) -> None:
+    _ops.esimd_norm_add_norm(h2_raw, h1, w1, w2, out, eps1, eps2)
+
+
+def esimd_kv_scatter(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    _ops.esimd_kv_scatter(k, v, k_cache, v_cache, indices)
+
+
+def esimd_rmsnorm_residual_scalar(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    scalar: float,
+) -> torch.Tensor:
+    return _ops.esimd_rmsnorm_residual_scalar(
+        x, weight, residual, output, eps, scalar
+    )
+
+
+def onednn_fp8_gemm_w8a16(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return _ops.onednn_fp8_gemm_w8a16(input, weight, weight_scale, bias)
+
+
+def splitk_decode_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    scratch: torch.Tensor,
+    max_seq_len: int,
+    num_splits: int,
+) -> None:
+    _eagle_ops.splitk_decode_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        out,
+        scratch,
+        max_seq_len,
+        num_splits,
+    )

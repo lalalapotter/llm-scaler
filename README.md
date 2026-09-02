@@ -5,6 +5,9 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 ---
 
 ## Latest Update
+- 🔥[2026.08] We released `intel/llm-scaler-vllm:0.21.0-b3.1` for Muse-Glimmer-30B multi-modal support. 
+- 🔥[2026.08] We released `intel/llm-scaler-omni:0.2.0-b1` to support ComfyUI 0.31 XPU stack, MiniMax H3 local video generation, Wan Animate 2 workflows, add optimizations for Wan 2.2 14B T2V Turbo, LTX-2, Z-Image/Lumina and Krea2 workflows, and support Quantized ComfyUI workflows (GGUF Q4_1 and Nunchaku W4A16)
+- 🔥[2026.08] We released `intel/llm-scaler-vllm:0.21.0-b3` to support Muse-Glimmer-30B, support DFlash for Muse-Glimmer-30B and Qwen3.6-27B, and improve TTFT for gemma-4-31B-it and gemma-4-26B-A4B-it. 
 - 🔥[2026.08] We released `intel/llm-scaler-vllm:0.21.0-b2` to support Multi-token Prediction (MTP) and Lora Serving for Qwen3.6-27B, Qwen3.6-35B-A3B, gemma-4-31B-it and gemma-4-26B-A4B-it models, and support per-block quantization models Qwen3.6-27B-FP8 and Qwen3.6-35B-A3B-FP8. 
 - [2026.07] We released `intel/llm-scaler-omni:0.1.0-b8` to support ComfyUI 0.27.0,more workflows and models.
 - [2026.07] We released `intel/llm-scaler-vllm:0.21.0-b1` to support gemma-4 (12B, 31B and 26B-A4B) and diffusiongemma (26B-A4B) models, and experimentally support XPU graph. 
@@ -77,6 +80,7 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
 | meta-llama/Llama-3.1-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
 | meta-llama/Llama-3.1-70B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| meta-models/Muse-Glimmer-30B                   |     |         ✅         |                    |       |                           |
 | baichuan-inc/Baichuan2-7B-Chat             |  ✅  |         ✅         |          ✅          |       | with chat_template        |
 | baichuan-inc/Baichuan2-13B-Chat            |  ✅  |         ✅         |          ✅          |       | with chat_template        |
 | THUDM/CodeGeex4-All-9B                     |  ✅  |         ✅         |          ✅          |       | with chat_template        |
@@ -144,7 +148,7 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 `llm-scaler-omni` supports running image/voice/video generation etc., featuring `Omni Studio` mode (using ComfyUI) and `Omni Serving` mode (via SGLang Diffusion or Xinference).  
 
 
-Please follow the instructions in the [Getting Started](omni/README.md/#getting-started-with-omni-docker-image) to use `llm-scaler-omni`. 
+Please follow the instructions in the [Getting Started](omni/README.md#getting-started-with-the-omni-docker-image) to use `llm-scaler-omni`.
 
 
 ### Omni Demos
@@ -175,7 +179,7 @@ Please follow the instructions in the [Getting Started](omni/README.md/#getting-
 | **Video Upscaling** | SeedVR2 | Video Restoration and Upscaling | 
 
 
-Please check [ComfyUI Support](omni/README.md/#comfyui) for more details.
+Please check [ComfyUI Support](omni/docs/COMFYUI.md) for more details.
 
 ### Omni Serving (OpenAI-API compatible serving)
 
@@ -185,7 +189,7 @@ Please check [ComfyUI Support](omni/README.md/#comfyui) for more details.
 - Text to Speech (`/v1/audio/speech`): Kokoro 82M
 - Speech to Text (`/v1/audio/transcriptions`): whisper-large-v3
 
-Please check [Xinference Support](omni/README.md/#xinference) for more details. 
+Please check the [b8 Xinference documentation](https://github.com/intel/llm-scaler/blob/omni-0.1.0-b8/omni/README.md#xinference) for more details.
 
 ---
 ## Releases
